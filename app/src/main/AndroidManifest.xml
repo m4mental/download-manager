@@ -21,6 +21,18 @@
         tools:ignore="ScopedStorage" />
     <!-- Boot receiver for auto-resume -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Vibrate for download completion feedback -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Queries for Nothing Player and media handler visibility (Android 11+) -->
+    <queries>
+        <package android:name="com.nothing.player" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="*/*" />
+        </intent>
+    </queries>
+
 
     <application
         android:allowBackup="true"
@@ -73,6 +85,17 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- FileProvider for secure file sharing with external apps & Nothing Player -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths" />
+        </provider>
 
     </application>
 

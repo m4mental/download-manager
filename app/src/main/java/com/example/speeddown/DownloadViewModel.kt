@@ -70,6 +70,12 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun open(item: DownloadItem) = repo.openFile(item)
 
+    fun isNothingPlayerInstalled(): Boolean = repo.isNothingPlayerInstalled()
+
+    fun openInNothingPlayer(item: DownloadItem): Boolean = repo.openInNothingPlayer(item)
+
+    fun launchNothingPlayer(): Boolean = repo.launchNothingPlayerApp()
+
     fun delete(item: DownloadItem, deleteFile: Boolean = true) {
         viewModelScope.launch { repo.deleteDownload(item, deleteFile) }
     }

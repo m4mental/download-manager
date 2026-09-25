@@ -229,6 +229,7 @@ class MultiThreadDownloader(
                             partProgressBytes = partProgressBytes[i],
                             totalDownloaded = totalDownloaded,
                             speedLimitKbps = speedLimitKbps,
+                            threadCount = threadCount,
                             cancelFlag = cancelFlag,
                             pauseFlag = pauseFlag,
                             useRange = acceptsRanges && realEnd > 0
@@ -395,6 +396,7 @@ class MultiThreadDownloader(
         partProgressBytes: AtomicLong,
         totalDownloaded: AtomicLong,
         speedLimitKbps: Long,
+        threadCount: Int,
         cancelFlag: AtomicBoolean,
         pauseFlag: AtomicBoolean,
         useRange: Boolean
@@ -460,7 +462,11 @@ class MultiThreadDownloader(
                         partProgressBytes.addAndGet(read.toLong())
                         totalDownloaded.addAndGet(read.toLong())
                         if (speedLimitKbps > 0) {
-                            delay(2)
+                            val perThreadBps = (speedLimitKbps * 1024L) / java.lang.Math.max(1, threadCount)
+                            val sleepMs = ((read.toDouble() / perThreadBps) * 1000.0).toLong()
+                            if (sleepMs > 0) {
+                                delay(sleepMs.coerceAtMost(250L))
+                            }
                         }
                     }
                     fileOut.flush()

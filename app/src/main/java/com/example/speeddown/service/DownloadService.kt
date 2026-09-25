@@ -24,6 +24,7 @@ class DownloadService : Service() {
         const val ACTION_CANCEL = "ACTION_CANCEL"
         const val EXTRA_DOWNLOAD_ID = "EXTRA_DOWNLOAD_ID"
         const val CHANNEL_ID = "SpeedDown_Channel"
+        const val COMPLETE_CHANNEL_ID = "SpeedDown_Complete_Channel"
         const val NOTIFICATION_ID = 1001
     }
 
@@ -287,18 +288,43 @@ class DownloadService : Service() {
 
     private fun showDownloadCompleteNotification(fileName: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val settings = kotlinx.coroutines.runBlocking {
+            try { store.getSettingsSnapshot() } catch (_: Exception) { com.example.speeddown.data.DownloadSettings() }
+        }
+
+        // Haptic feedback if enabled
+        if (settings.vibrateOnComplete) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val vm = getSystemService(VIBRATOR_MANAGER_SERVICE) as? android.os.VibratorManager
+                    vm?.defaultVibrator?.vibrate(android.os.VibrationEffect.createOneShot(200, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    val v = getSystemService(VIBRATOR_SERVICE) as? android.os.Vibrator
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        v?.vibrate(android.os.VibrationEffect.createOneShot(200, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        v?.vibrate(200)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
         val openIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Download Complete")
+        val channelToUse = if (settings.soundOnComplete) COMPLETE_CHANNEL_ID else CHANNEL_ID
+        val notification = NotificationCompat.Builder(this, channelToUse)
+            .setContentTitle("Download Complete ✓")
             .setContentText(fileName)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentIntent(openIntent)
             .setAutoCancel(true)
             .setOngoing(false)
+            .setPriority(if (settings.soundOnComplete) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
             .build()
         val completeId = (System.currentTimeMillis() % 100000).toInt() + 2000
         nm.notify(completeId, notification)
@@ -312,10 +338,24 @@ class DownloadService : Service() {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID, "SpeedDown Downloads", NotificationManager.IMPORTANCE_LOW
-        ).apply { description = "Download progress notifications" }
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            val progressChannel = NotificationChannel(
+                CHANNEL_ID, "SpeedDown Active Downloads", NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Download progress notifications"
+                enableVibration(false)
+                setSound(null, null)
+            }
+            val completeChannel = NotificationChannel(
+                COMPLETE_CHANNEL_ID, "SpeedDown Completed Downloads", NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Notifications when downloads finish"
+                enableVibration(true)
+            }
+            nm.createNotificationChannel(progressChannel)
+            nm.createNotificationChannel(completeChannel)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

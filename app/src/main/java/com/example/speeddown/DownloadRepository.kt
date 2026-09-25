@@ -47,6 +47,7 @@ class DownloadRepository(private val context: Context) {
             .ifBlank { "download_${System.currentTimeMillis()}" }
 
         val settingsSnapshot = store.getSettingsSnapshot()
+        val effectiveThreads = if (threads <= 0) settingsSnapshot.defaultThreads else threads
         val category = determineCategory(sanitizedFileName)
         val targetDir = if (settingsSnapshot.autoCategorize) {
             File(baseDownloadsDir, "SpeedDown/$category")
@@ -61,7 +62,7 @@ class DownloadRepository(private val context: Context) {
             url = url.trim(),
             fileName = sanitizedFileName,
             filePath = filePath,
-            threads = threads,
+            threads = effectiveThreads,
             status = DownloadStatus.QUEUED,
             category = category
         )
@@ -168,20 +169,106 @@ class DownloadRepository(private val context: Context) {
         store.clearByStatus(DownloadStatus.CANCELLED)
     }
 
+    fun isNothingPlayerInstalled(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    "com.nothing.player",
+                    android.content.pm.PackageManager.PackageInfoFlags.of(0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo("com.nothing.player", 0)
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun launchNothingPlayerApp(): Boolean {
+        return try {
+            val intent = context.packageManager.getLaunchIntentForPackage("com.nothing.player")
+            if (intent != null) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+                true
+            } else false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun getShareableUri(file: File): Uri {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                androidx.core.content.FileProvider.getUriForFile(
+                    context, "${context.packageName}.fileprovider", file
+                )
+            } else {
+                Uri.fromFile(file)
+            }
+        } catch (_: Exception) {
+            Uri.fromFile(file)
+        }
+    }
+
+    fun openInNothingPlayer(item: DownloadItem): Boolean {
+        val file = File(item.filePath)
+        if (!file.exists()) return false
+
+        val uri = getShareableUri(file)
+        val mime = try {
+            context.contentResolver.getType(uri)
+        } catch (_: Exception) { null } ?: when (item.category) {
+            "Videos" -> "video/*"
+            "Music" -> "audio/*"
+            else -> "*/*"
+        }
+
+        return try {
+            val intent = Intent().apply {
+                setClassName("com.nothing.player", "com.nothing.player.ExoVideoPlayerActivity")
+                putExtra("path", item.filePath)
+                putExtra("video_path", item.filePath)
+                putExtra("title", item.fileName)
+                putExtra("video_title", item.fileName)
+                putExtra("contentUri", uri.toString())
+                putExtra("video_uri", uri.toString())
+                setDataAndType(uri, mime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            // Fallback to launcher intent
+            launchNothingPlayerApp()
+        }
+    }
+
     fun openFile(item: DownloadItem) {
         val file = File(item.filePath)
         if (!file.exists()) return
-        val uri: Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            androidx.core.content.FileProvider.getUriForFile(
-                context, "${context.packageName}.fileprovider", file
-            )
-        } else Uri.fromFile(file)
 
-        val mime = context.contentResolver.getType(uri) ?: "*/*"
-        context.startActivity(Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mime)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        })
+        // Smart route to Nothing Player if preferred and media type
+        val snapshot = kotlinx.coroutines.runBlocking {
+            try { store.getSettingsSnapshot() } catch (_: Exception) { DownloadSettings() }
+        }
+        if (snapshot.preferNothingPlayer && (item.category == "Videos" || item.category == "Music") && isNothingPlayerInstalled()) {
+            if (openInNothingPlayer(item)) return
+        }
+
+        val uri = getShareableUri(file)
+        val mime = try {
+            context.contentResolver.getType(uri)
+        } catch (_: Exception) { null } ?: "*/*"
+
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        } catch (_: Exception) {}
     }
 
     private fun startServiceAction(action: String, downloadId: Long) {

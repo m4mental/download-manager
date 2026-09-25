@@ -37,6 +37,7 @@ import com.example.speeddown.data.DownloadItem
 import com.example.speeddown.data.DownloadSettings
 import com.example.speeddown.data.DownloadStatus
 import com.example.speeddown.ui.browser.BrowserScreen
+import com.example.speeddown.ui.settings.SettingsScreen
 import kotlinx.coroutines.launch
 import kotlin.math.ln
 import kotlin.math.pow
@@ -62,6 +63,7 @@ enum class DownloadTab(val title: String) {
 @Composable
 fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     var showBrowser by remember { mutableStateOf(false) }
+    var showSettingsScreen by remember { mutableStateOf(false) }
 
     if (showBrowser) {
         BrowserScreen(
@@ -71,6 +73,14 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 viewModel.addDownload(url, name, threads)
                 showBrowser = false
             }
+        )
+        return
+    }
+
+    if (showSettingsScreen) {
+        SettingsScreen(
+            viewModel = viewModel,
+            onBack = { showSettingsScreen = false }
         )
         return
     }
@@ -144,7 +154,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                     IconButton(onClick = { viewModel.clearCompleted() }) {
                         Icon(Icons.Filled.CleaningServices, "Clear completed")
                     }
-                    IconButton(onClick = { showSettingsDialog = true }) {
+                    IconButton(onClick = { showSettingsScreen = true }) {
                         Icon(Icons.Filled.Settings, "Settings")
                     }
                 },
@@ -309,7 +319,9 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                                 onDelete = { deleteTargetItem = item },
                                 onOpen = { viewModel.open(item) },
                                 onShowError = { errorDetailItem = item },
-                                onShowChecksum = { checksumTargetItem = item }
+                                onShowChecksum = { checksumTargetItem = item },
+                                isNothingPlayerInstalled = viewModel.isNothingPlayerInstalled(),
+                                onOpenWithNothingPlayer = { viewModel.openInNothingPlayer(item) }
                             )
                         }
                         item { Spacer(Modifier.height(88.dp)) }
@@ -337,13 +349,6 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 showAddDialog = false
                 initialUrlForDialog = null
             }
-        )
-    }
-    if (showSettingsDialog) {
-        SettingsDialog(
-            settings = settings,
-            onUpdateSettings = { viewModel.updateSettings(it) },
-            onDismiss = { showSettingsDialog = false }
         )
     }
     errorDetailItem?.let { item ->
@@ -481,7 +486,9 @@ fun DownloadCard(
     onDelete: () -> Unit,
     onOpen: () -> Unit,
     onShowError: () -> Unit,
-    onShowChecksum: () -> Unit
+    onShowChecksum: () -> Unit,
+    isNothingPlayerInstalled: Boolean = false,
+    onOpenWithNothingPlayer: (() -> Unit)? = null
 ) {
     val statusColor = statusColor(item.status)
     val isActive = item.status == DownloadStatus.DOWNLOADING
@@ -693,6 +700,12 @@ fun DownloadCard(
                         ActionBtn("Cancel", Icons.Filled.Close,     Red,  onCancel)
                     }
                     DownloadStatus.COMPLETED -> {
+                        if (isNothingPlayerInstalled && (item.category == "Videos" || item.category == "Music")) {
+                            ActionBtn("Nothing Player", Icons.Filled.PlayCircle, Purple) {
+                                if (onOpenWithNothingPlayer != null) onOpenWithNothingPlayer() else onOpen()
+                            }
+                            Spacer(Modifier.width(8.dp))
+                        }
                         ActionBtn("Open",   Icons.AutoMirrored.Filled.OpenInNew, Green, onOpen)
                         Spacer(Modifier.width(8.dp))
                         ActionBtn("Hash",   Icons.Filled.VerifiedUser, Purple, onShowChecksum)
@@ -1288,121 +1301,6 @@ fun ChecksumDialog(
     )
 }
 
-// ─── Settings Dialog ──────────────────────────────────────────────────────────
-@Composable
-fun SettingsDialog(
-    settings: DownloadSettings,
-    onUpdateSettings: (DownloadSettings) -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.Settings, null, tint = Purple)
-                Spacer(Modifier.width(8.dp))
-                Text("Settings & Queue", fontWeight = FontWeight.Bold)
-            }
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
-                // Wi-Fi Only Switch
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Filled.Wifi, null, tint = Purple, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Download on Wi-Fi Only", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        }
-                        Text("Pause/queue downloads on mobile data", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Switch(
-                        checked = settings.wifiOnly,
-                        onCheckedChange = { onUpdateSettings(settings.copy(wifiOnly = it)) }
-                    )
-                }
-
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
-
-                // Auto Categorize Switch
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Filled.Folder, null, tint = Purple, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Auto-Categorize Folders", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        }
-                        Text("Sort into SpeedDown/Videos, Music, etc.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Switch(
-                        checked = settings.autoCategorize,
-                        onCheckedChange = { onUpdateSettings(settings.copy(autoCategorize = it)) }
-                    )
-                }
-
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
-
-                // Max Concurrent Active Downloads
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Queue, null, tint = Purple, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Max Concurrent Active Downloads", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text("Excess downloads stay Queued and auto-start on finish", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        listOf(1, 2, 3, 5, 0).forEach { limit ->
-                            val label = if (limit == 0) "All" else "$limit"
-                            val isSel = settings.maxConcurrent == limit
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (isSel) Purple else MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(32.dp)
-                                    .clickable { onUpdateSettings(settings.copy(maxConcurrent = limit)) }
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text(
-                                        label,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isSel) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
-
-                // Info items
-                listOf(
-                    "⚡ Multi-Threading: Up to 100 threads per file",
-                    "📂 Storage: /Download/SpeedDown/",
-                    "🌐 Built-in Media Sniffer Browser supported"
-                ).forEach {
-                    Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done", fontWeight = FontWeight.Bold) } }
-    )
-}
 
 // ─── Contextual Tab Empty State ───────────────────────────────────────────────
 @Composable

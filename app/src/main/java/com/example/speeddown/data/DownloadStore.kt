@@ -24,7 +24,11 @@ data class DownloadSettings(
     val maxConcurrent: Int = 2,
     val wifiOnly: Boolean = false,
     val autoCategorize: Boolean = true,
-    val speedLimitKbps: Long = 0L // 0 = unlimited
+    val speedLimitKbps: Long = 0L, // 0 = unlimited
+    val preferNothingPlayer: Boolean = true,
+    val vibrateOnComplete: Boolean = true,
+    val soundOnComplete: Boolean = true,
+    val defaultThreads: Int = 8
 )
 
 class DownloadStore private constructor(private val context: Context) {
@@ -46,13 +50,21 @@ class DownloadStore private constructor(private val context: Context) {
     private val WIFI_ONLY_KEY = booleanPreferencesKey("settings_wifi_only")
     private val AUTO_CATEGORIZE_KEY = booleanPreferencesKey("settings_auto_categorize")
     private val SPEED_LIMIT_KEY = longPreferencesKey("settings_speed_limit")
+    private val PREFER_NOTHING_PLAYER_KEY = booleanPreferencesKey("settings_prefer_nothing_player")
+    private val VIBRATE_ON_COMPLETE_KEY = booleanPreferencesKey("settings_vibrate_on_complete")
+    private val SOUND_ON_COMPLETE_KEY = booleanPreferencesKey("settings_sound_on_complete")
+    private val DEFAULT_THREADS_KEY = intPreferencesKey("settings_default_threads")
 
     val settings: Flow<DownloadSettings> = context.dataStore.data.map { prefs ->
         DownloadSettings(
             maxConcurrent = prefs[MAX_CONCURRENT_KEY] ?: 2,
             wifiOnly = prefs[WIFI_ONLY_KEY] ?: false,
             autoCategorize = prefs[AUTO_CATEGORIZE_KEY] ?: true,
-            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L
+            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L,
+            preferNothingPlayer = prefs[PREFER_NOTHING_PLAYER_KEY] ?: true,
+            vibrateOnComplete = prefs[VIBRATE_ON_COMPLETE_KEY] ?: true,
+            soundOnComplete = prefs[SOUND_ON_COMPLETE_KEY] ?: true,
+            defaultThreads = prefs[DEFAULT_THREADS_KEY] ?: 8
         )
     }
 
@@ -62,7 +74,11 @@ class DownloadStore private constructor(private val context: Context) {
             maxConcurrent = prefs[MAX_CONCURRENT_KEY] ?: 2,
             wifiOnly = prefs[WIFI_ONLY_KEY] ?: false,
             autoCategorize = prefs[AUTO_CATEGORIZE_KEY] ?: true,
-            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L
+            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L,
+            preferNothingPlayer = prefs[PREFER_NOTHING_PLAYER_KEY] ?: true,
+            vibrateOnComplete = prefs[VIBRATE_ON_COMPLETE_KEY] ?: true,
+            soundOnComplete = prefs[SOUND_ON_COMPLETE_KEY] ?: true,
+            defaultThreads = prefs[DEFAULT_THREADS_KEY] ?: 8
         )
     }
 
@@ -72,6 +88,10 @@ class DownloadStore private constructor(private val context: Context) {
             prefs[WIFI_ONLY_KEY] = newSettings.wifiOnly
             prefs[AUTO_CATEGORIZE_KEY] = newSettings.autoCategorize
             prefs[SPEED_LIMIT_KEY] = newSettings.speedLimitKbps
+            prefs[PREFER_NOTHING_PLAYER_KEY] = newSettings.preferNothingPlayer
+            prefs[VIBRATE_ON_COMPLETE_KEY] = newSettings.vibrateOnComplete
+            prefs[SOUND_ON_COMPLETE_KEY] = newSettings.soundOnComplete
+            prefs[DEFAULT_THREADS_KEY] = newSettings.defaultThreads
         }
     }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
