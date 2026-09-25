@@ -43,7 +43,8 @@ class MultiThreadDownloader(
     fun startDownload(
         scope: CoroutineScope,
         item: DownloadItem,
-        onProgress: (downloaded: Long, speed: Long) -> Unit,
+        speedLimitKbps: Long = 0L,
+        onProgress: (downloaded: Long, speed: Long, parts: List<Float>) -> Unit,
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
@@ -59,7 +60,7 @@ class MultiThreadDownloader(
         var job: Job? = null
         job = scope.launch(Dispatchers.IO) {
             try {
-                performDownload(item, cancelFlag, pauseFlag, onProgress, onComplete, onError)
+                performDownload(item, speedLimitKbps, cancelFlag, pauseFlag, onProgress, onComplete, onError)
             } catch (_: CancellationException) {
                 // Coroutine cancellation occurs normally on pause or restart.
                 Log.d(TAG, "Download ${item.id} coroutine stopped (paused=${pauseFlag.get()})")
@@ -67,13 +68,17 @@ class MultiThreadDownloader(
                     store.updateStatus(item.id, DownloadStatus.PAUSED)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Download ${item.id} error: ${e.message}", e)
-                val friendlyError = mapToFriendlyError(e)
-                onError(friendlyError)
+                if (cancelFlag.get() || pauseFlag.get()) {
+                    Log.d(TAG, "Download ${item.id} stopped due to cancel/pause, ignoring: ${e.message}")
+                } else {
+                    Log.e(TAG, "Download ${item.id} error: ${e.message}", e)
+                    val friendlyError = mapToFriendlyError(e)
+                    onError(friendlyError)
+                }
             } finally {
                 job?.let { activeJobs.remove(item.id, it) }
-                cancelFlags.remove(item.id, cancelFlag)
-                pauseFlags.remove(item.id, pauseFlag)
+                cancelFlags.remove(item.id)
+                pauseFlags.remove(item.id)
                 activeCalls.remove(item.id)
             }
         }
@@ -89,11 +94,12 @@ class MultiThreadDownloader(
     fun resumeDownload(
         scope: CoroutineScope,
         item: DownloadItem,
-        onProgress: (Long, Long) -> Unit,
+        speedLimitKbps: Long = 0L,
+        onProgress: (Long, Long, List<Float>) -> Unit,
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
-        startDownload(scope, item, onProgress, onComplete, onError)
+        startDownload(scope, item, speedLimitKbps, onProgress, onComplete, onError)
     }
 
     fun cancelDownload(downloadId: Long) {
@@ -104,16 +110,19 @@ class MultiThreadDownloader(
     }
 
     private fun cancelOngoingCalls(downloadId: Long) {
-        activeCalls[downloadId]?.toList()?.forEach { call ->
+        val calls = activeCalls[downloadId]?.toList()
+        calls?.forEach { call ->
             try { call.cancel() } catch (_: Exception) {}
         }
+        activeCalls.remove(downloadId)
     }
 
     private suspend fun performDownload(
         item: DownloadItem,
+        speedLimitKbps: Long,
         cancelFlag: AtomicBoolean,
         pauseFlag: AtomicBoolean,
-        onProgress: (Long, Long) -> Unit,
+        onProgress: (Long, Long, List<Float>) -> Unit,
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
@@ -126,7 +135,7 @@ class MultiThreadDownloader(
         targetFile.parentFile?.mkdirs()
 
         // Probe URL using GET Range to support S3/R2 Presigned URLs, CDNs, and Google Drive
-        val probeResult = probeUrl(item.url)
+        val probeResult = probeUrl(item.id, item.url, cancelFlag)
         if (cancelFlag.get()) {
             store.updateStatus(item.id, DownloadStatus.CANCELLED)
             return
@@ -148,6 +157,12 @@ class MultiThreadDownloader(
 
         val chunkSize = if (contentLength > 0) contentLength / threadCount else 0L
 
+        // Track bytes per part for IDM-style live segmented visualizer
+        val partProgressBytes = Array(threadCount) { i ->
+            val pFile = getPartFile(item.filePath, i, threadCount)
+            AtomicLong(if (acceptsRanges && pFile.exists()) pFile.length() else 0L)
+        }
+
         // Calculate already downloaded bytes from existing part files
         val initialBytes = if (acceptsRanges) {
             (0 until threadCount).sumOf { i ->
@@ -164,7 +179,7 @@ class MultiThreadDownloader(
         var lastSpeedBytes = initialBytes
         var smoothedSpeed = 0L
 
-        // Speed & Progress Reporter with Exponential Moving Average (EMA)
+        // Speed & Progress Reporter with Exponential Moving Average (EMA) and Segment Tracking
         val progressJob = CoroutineScope(Dispatchers.IO).launch {
             while (isActive && !cancelFlag.get() && !pauseFlag.get()) {
                 delay(500)
@@ -183,7 +198,15 @@ class MultiThreadDownloader(
 
                 lastSpeedCheck = now
                 lastSpeedBytes = current
-                onProgress(current, smoothedSpeed.coerceAtLeast(0L))
+
+                val parts = if (chunkSize > 0) {
+                    (0 until threadCount).map { i ->
+                        val targetLen = if (i == threadCount - 1) (contentLength - i * chunkSize) else chunkSize
+                        if (targetLen > 0) (partProgressBytes[i].get().toFloat() / targetLen.toFloat()).coerceIn(0f, 1f) else 0f
+                    }
+                } else emptyList()
+
+                onProgress(current, smoothedSpeed.coerceAtLeast(0L), parts)
             }
         }
 
@@ -203,7 +226,9 @@ class MultiThreadDownloader(
                             partFile = partFile,
                             chunkStart = realStart,
                             chunkEnd = realEnd,
+                            partProgressBytes = partProgressBytes[i],
                             totalDownloaded = totalDownloaded,
+                            speedLimitKbps = speedLimitKbps,
                             cancelFlag = cancelFlag,
                             pauseFlag = pauseFlag,
                             useRange = acceptsRanges && realEnd > 0
@@ -225,20 +250,33 @@ class MultiThreadDownloader(
 
         if (pauseFlag.get()) {
             val currentDownloaded = totalDownloaded.get()
-            store.updateProgress(item.id, currentDownloaded, 0L, DownloadStatus.PAUSED)
+            val pausedParts = if (chunkSize > 0) {
+                (0 until threadCount).map { i ->
+                    val targetLen = if (i == threadCount - 1) (contentLength - i * chunkSize) else chunkSize
+                    if (targetLen > 0) (partProgressBytes[i].get().toFloat() / targetLen.toFloat()).coerceIn(0f, 1f) else 0f
+                }
+            } else emptyList()
+            store.updateProgress(item.id, currentDownloaded, 0L, DownloadStatus.PAUSED, pausedParts)
             return
         }
 
         // All parts completed successfully! Merge parts into target file.
         mergeParts(targetFile, item.filePath, threadCount)
 
-        onProgress(totalDownloaded.get(), 0L)
+        val completedParts = (0 until threadCount).map { 1f }
+        onProgress(totalDownloaded.get(), 0L, completedParts)
         onComplete()
     }
 
     private data class ProbeResult(val contentLength: Long, val acceptsRanges: Boolean)
 
-    private fun probeUrl(url: String): ProbeResult {
+    private fun probeUrl(downloadId: Long, url: String, cancelFlag: AtomicBoolean): ProbeResult {
+        if (cancelFlag.get()) return ProbeResult(-1L, false)
+
+        val callList = activeCalls.computeIfAbsent(downloadId) {
+            java.util.Collections.synchronizedList(mutableListOf())
+        }
+
         // Step 1: Probe with GET Range: bytes=0-0 (Standard browser method for S3/R2 presigned URLs)
         try {
             val rangeReq = Request.Builder()
@@ -248,23 +286,36 @@ class MultiThreadDownloader(
                 .header("Range", "bytes=0-0")
                 .build()
 
-            okHttpClient.newCall(rangeReq).execute().use { response ->
-                if (response.code == 206) {
-                    val contentRange = response.header("Content-Range")
-                    val totalFromRange = contentRange?.substringAfterLast("/")?.toLongOrNull() ?: -1L
-                    val length = if (totalFromRange > 0) totalFromRange else (response.header("Content-Length")?.toLongOrNull() ?: -1L)
-                    return ProbeResult(length, acceptsRanges = true)
-                } else if (response.isSuccessful) {
-                    val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
-                    val ranges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
-                    return ProbeResult(length, acceptsRanges = ranges)
-                } else {
-                    throw IOException("HTTP ${response.code}: ${getHttpErrorMessage(response.code)}")
+            val call = okHttpClient.newCall(rangeReq)
+            callList.add(call)
+
+            try {
+                call.execute().use { response ->
+                    callList.remove(call)
+                    if (cancelFlag.get()) return ProbeResult(-1L, false)
+                    if (response.code == 206) {
+                        val contentRange = response.header("Content-Range")
+                        val totalFromRange = contentRange?.substringAfterLast("/")?.toLongOrNull() ?: -1L
+                        val length = if (totalFromRange > 0) totalFromRange else (response.header("Content-Length")?.toLongOrNull() ?: -1L)
+                        return ProbeResult(length, acceptsRanges = true)
+                    } else if (response.isSuccessful) {
+                        val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
+                        val ranges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
+                        return ProbeResult(length, acceptsRanges = ranges)
+                    } else {
+                        throw IOException("HTTP ${response.code}: ${getHttpErrorMessage(response.code)}")
+                    }
                 }
+            } catch (e: IOException) {
+                callList.remove(call)
+                if (cancelFlag.get()) return ProbeResult(-1L, false)
+                if (e.message?.startsWith("HTTP ") == true) throw e
             }
-        } catch (e: IOException) {
-            if (e.message?.startsWith("HTTP ") == true) throw e
+        } catch (_: Exception) {
+            if (cancelFlag.get()) return ProbeResult(-1L, false)
         }
+
+        if (cancelFlag.get()) return ProbeResult(-1L, false)
 
         // Step 2: Fallback to standard GET probe
         val getReq = Request.Builder()
@@ -273,13 +324,24 @@ class MultiThreadDownloader(
             .header("Accept", "*/*")
             .build()
 
-        okHttpClient.newCall(getReq).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code}: ${getHttpErrorMessage(response.code)}")
+        val getCall = okHttpClient.newCall(getReq)
+        callList.add(getCall)
+
+        try {
+            getCall.execute().use { response ->
+                callList.remove(getCall)
+                if (cancelFlag.get()) return ProbeResult(-1L, false)
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code}: ${getHttpErrorMessage(response.code)}")
+                }
+                val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
+                val acceptsRanges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
+                return ProbeResult(length, acceptsRanges)
             }
-            val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
-            val acceptsRanges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
-            return ProbeResult(length, acceptsRanges)
+        } catch (e: Exception) {
+            callList.remove(getCall)
+            if (cancelFlag.get()) return ProbeResult(-1L, false)
+            throw e
         }
     }
 
@@ -330,12 +392,15 @@ class MultiThreadDownloader(
         partFile: File,
         chunkStart: Long,
         chunkEnd: Long,
+        partProgressBytes: AtomicLong,
         totalDownloaded: AtomicLong,
+        speedLimitKbps: Long,
         cancelFlag: AtomicBoolean,
         pauseFlag: AtomicBoolean,
         useRange: Boolean
     ) {
         val existingBytes = if (useRange && partFile.exists()) partFile.length() else 0L
+        partProgressBytes.set(existingBytes)
 
         // Check if this chunk is already finished
         if (useRange && chunkEnd > 0 && chunkStart + existingBytes > chunkEnd) {
@@ -392,7 +457,11 @@ class MultiThreadDownloader(
                         val read = stream.read(buffer)
                         if (read == -1) break
                         fileOut.write(buffer, 0, read)
+                        partProgressBytes.addAndGet(read.toLong())
                         totalDownloaded.addAndGet(read.toLong())
+                        if (speedLimitKbps > 0) {
+                            delay(2)
+                        }
                     }
                     fileOut.flush()
                 }

@@ -4,8 +4,11 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.speeddown.data.DownloadItem
+import com.example.speeddown.data.DownloadSettings
 import com.example.speeddown.data.DownloadStatus
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -19,8 +22,37 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         initialValue = emptyList()
     )
 
+    val settings = repo.settings.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = DownloadSettings()
+    )
+
+    private val _incomingShareUrl = MutableStateFlow<String?>(null)
+    val incomingShareUrl = _incomingShareUrl.asStateFlow()
+
+    fun setIncomingShareUrl(url: String) {
+        _incomingShareUrl.value = url
+    }
+
+    fun onShareUrlHandled() {
+        _incomingShareUrl.value = null
+    }
+
+    fun updateSettings(newSettings: DownloadSettings) {
+        viewModelScope.launch { repo.updateSettings(newSettings) }
+    }
+
     fun addDownload(url: String, fileName: String, threads: Int) {
         viewModelScope.launch { repo.addDownload(url = url, fileName = fileName, threads = threads) }
+    }
+
+    fun addBatchDownloads(urls: List<String>, threads: Int) {
+        viewModelScope.launch { repo.addBatchDownloads(urls, threads) }
+    }
+
+    suspend fun calculateChecksums(filePath: String): Pair<String, String> {
+        return repo.calculateChecksums(filePath)
     }
 
     fun pause(item: DownloadItem) {

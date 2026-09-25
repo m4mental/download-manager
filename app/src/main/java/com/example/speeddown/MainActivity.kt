@@ -13,6 +13,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.launch
 import com.example.speeddown.theme.SpeedDownTheme
 import com.example.speeddown.ui.DownloadManagerScreen
 
@@ -35,6 +36,24 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Dismiss any orphaned notification if no downloads are active
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            val store = com.example.speeddown.data.DownloadStore.getInstance(this@MainActivity)
+            store.ensureLoaded()
+            if (store.getActiveDownloads().isEmpty()) {
+                val nm = getSystemService(android.content.Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+                nm?.cancel(com.example.speeddown.service.DownloadService.NOTIFICATION_ID)
+                try {
+                    val cancelIntent = android.content.Intent(this@MainActivity, com.example.speeddown.service.DownloadService::class.java).apply {
+                        action = com.example.speeddown.service.DownloadService.ACTION_CANCEL
+                    }
+                    startService(cancelIntent)
+                } catch (_: Exception) {}
+            }
+        }
+
+        handleIntent(intent)
+
         setContent {
             SpeedDownTheme {
                 Surface(
@@ -44,6 +63,31 @@ class MainActivity : ComponentActivity() {
                     DownloadManagerScreen(viewModel)
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: android.content.Intent?) {
+        if (intent == null) return
+        val rawUrl = when (intent.action) {
+            android.content.Intent.ACTION_SEND -> {
+                intent.getStringExtra(android.content.Intent.EXTRA_TEXT)
+            }
+            android.content.Intent.ACTION_VIEW -> {
+                intent.dataString
+            }
+            else -> null
+        } ?: return
+
+        val matcher = Regex("https?://[\\w\\d:#@%/;\$()~_?\\+-=\\\\\\.&]+", RegexOption.IGNORE_CASE)
+        val extracted = matcher.find(rawUrl)?.value ?: rawUrl.trim()
+        if (extracted.startsWith("http://") || extracted.startsWith("https://")) {
+            viewModel.setIncomingShareUrl(extracted)
         }
     }
 }

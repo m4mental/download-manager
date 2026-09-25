@@ -2,22 +2,30 @@ package com.example.speeddown.data
 
 import android.content.Context
 import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "downloads_store")
+
+@Serializable
+data class DownloadSettings(
+    val maxConcurrent: Int = 2,
+    val wifiOnly: Boolean = false,
+    val autoCategorize: Boolean = true,
+    val speedLimitKbps: Long = 0L // 0 = unlimited
+)
 
 class DownloadStore private constructor(private val context: Context) {
 
@@ -34,6 +42,38 @@ class DownloadStore private constructor(private val context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val DOWNLOADS_KEY = stringPreferencesKey("downloads_list")
+    private val MAX_CONCURRENT_KEY = intPreferencesKey("settings_max_concurrent")
+    private val WIFI_ONLY_KEY = booleanPreferencesKey("settings_wifi_only")
+    private val AUTO_CATEGORIZE_KEY = booleanPreferencesKey("settings_auto_categorize")
+    private val SPEED_LIMIT_KEY = longPreferencesKey("settings_speed_limit")
+
+    val settings: Flow<DownloadSettings> = context.dataStore.data.map { prefs ->
+        DownloadSettings(
+            maxConcurrent = prefs[MAX_CONCURRENT_KEY] ?: 2,
+            wifiOnly = prefs[WIFI_ONLY_KEY] ?: false,
+            autoCategorize = prefs[AUTO_CATEGORIZE_KEY] ?: true,
+            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L
+        )
+    }
+
+    suspend fun getSettingsSnapshot(): DownloadSettings {
+        val prefs = context.dataStore.data.first()
+        return DownloadSettings(
+            maxConcurrent = prefs[MAX_CONCURRENT_KEY] ?: 2,
+            wifiOnly = prefs[WIFI_ONLY_KEY] ?: false,
+            autoCategorize = prefs[AUTO_CATEGORIZE_KEY] ?: true,
+            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L
+        )
+    }
+
+    suspend fun updateSettings(newSettings: DownloadSettings) {
+        context.dataStore.edit { prefs ->
+            prefs[MAX_CONCURRENT_KEY] = newSettings.maxConcurrent
+            prefs[WIFI_ONLY_KEY] = newSettings.wifiOnly
+            prefs[AUTO_CATEGORIZE_KEY] = newSettings.autoCategorize
+            prefs[SPEED_LIMIT_KEY] = newSettings.speedLimitKbps
+        }
+    }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val saveMutex = Mutex()
     private val isLoaded = CompletableDeferred<Unit>()
@@ -74,6 +114,10 @@ class DownloadStore private constructor(private val context: Context) {
         return _downloadsState.value.firstOrNull { it.id == id }
     }
 
+    fun getActiveDownloads(): List<DownloadItem> {
+        return _downloadsState.value.filter { it.status == DownloadStatus.DOWNLOADING }
+    }
+
     suspend fun upsert(item: DownloadItem) {
         ensureLoaded()
         _downloadsState.update { current ->
@@ -111,7 +155,13 @@ class DownloadStore private constructor(private val context: Context) {
         persistToDisk()
     }
 
-    suspend fun updateProgress(id: Long, downloaded: Long, speed: Long, status: DownloadStatus) {
+    suspend fun updateProgress(
+        id: Long,
+        downloaded: Long,
+        speed: Long,
+        status: DownloadStatus,
+        partProgress: List<Float> = emptyList()
+    ) {
         _downloadsState.update { current ->
             current.map {
                 if (it.id == id) {
@@ -123,7 +173,12 @@ class DownloadStore private constructor(private val context: Context) {
                         // Never allow late in-flight progress callbacks to overwrite paused or terminal status!
                         it.copy(downloadedSize = downloaded, speed = 0L)
                     } else {
-                        it.copy(downloadedSize = downloaded, speed = speed, status = status)
+                        it.copy(
+                            downloadedSize = downloaded,
+                            speed = speed,
+                            status = status,
+                            partProgress = if (partProgress.isNotEmpty()) partProgress else it.partProgress
+                        )
                     }
                 } else it
             }

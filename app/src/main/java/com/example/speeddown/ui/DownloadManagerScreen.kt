@@ -23,16 +23,20 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.speeddown.DownloadViewModel
 import com.example.speeddown.data.DownloadItem
+import com.example.speeddown.data.DownloadSettings
 import com.example.speeddown.data.DownloadStatus
+import com.example.speeddown.ui.browser.BrowserScreen
 import kotlinx.coroutines.launch
 import kotlin.math.ln
 import kotlin.math.pow
@@ -57,7 +61,23 @@ enum class DownloadTab(val title: String) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DownloadManagerScreen(viewModel: DownloadViewModel) {
+    var showBrowser by remember { mutableStateOf(false) }
+
+    if (showBrowser) {
+        BrowserScreen(
+            initialUrl = "https://www.google.com",
+            onClose = { showBrowser = false },
+            onStartDownload = { url, name, threads ->
+                viewModel.addDownload(url, name, threads)
+                showBrowser = false
+            }
+        )
+        return
+    }
+
     val downloads by viewModel.downloads.collectAsState()
+    val settings by viewModel.settings.collectAsState()
+    val incomingShareUrl by viewModel.incomingShareUrl.collectAsState()
     val coroutineScope = rememberCoroutineScope()
     val tabs = remember { DownloadTab.values() }
     val pagerState = rememberPagerState(
@@ -66,9 +86,33 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     )
 
     var showAddDialog by remember { mutableStateOf(false) }
+    var initialUrlForDialog by remember { mutableStateOf<String?>(null) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var errorDetailItem by remember { mutableStateOf<DownloadItem?>(null) }
     var deleteTargetItem by remember { mutableStateOf<DownloadItem?>(null) }
+    var checksumTargetItem by remember { mutableStateOf<DownloadItem?>(null) }
+
+    val clipboardManager = LocalClipboardManager.current
+    var clipboardUrl by remember { mutableStateOf<String?>(null) }
+
+    // Auto-open AddDownloadDialog when a link is shared to SpeedDown
+    LaunchedEffect(incomingShareUrl) {
+        incomingShareUrl?.let { url ->
+            initialUrlForDialog = url
+            showAddDialog = true
+            viewModel.onShareUrlHandled()
+        }
+    }
+
+    // Sniff clipboard for fresh downloadable links
+    LaunchedEffect(Unit) {
+        val clip = clipboardManager.getText()?.text?.trim() ?: ""
+        if ((clip.startsWith("http://") || clip.startsWith("https://")) &&
+            downloads.none { it.url == clip }
+        ) {
+            clipboardUrl = clip
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -94,6 +138,9 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                         Badge(containerColor = Purple) { Text("$active") }
                         Spacer(Modifier.width(6.dp))
                     }
+                    IconButton(onClick = { showBrowser = true }) {
+                        Icon(Icons.Filled.Language, "Built-in Browser", tint = Purple)
+                    }
                     IconButton(onClick = { viewModel.clearCompleted() }) {
                         Icon(Icons.Filled.CleaningServices, "Clear completed")
                     }
@@ -106,7 +153,10 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = { showAddDialog = true },
+                onClick = {
+                    initialUrlForDialog = null
+                    showAddDialog = true
+                },
                 containerColor = Purple,
                 contentColor = Color.White,
                 icon = { Icon(Icons.Filled.Add, "Add") },
@@ -116,6 +166,56 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     ) { padding ->
         Column(modifier = Modifier.padding(padding)) {
             DownloadStatsBar(downloads)
+
+            // ─── Clipboard Link Auto-Sniffer Banner ───────────────────────────
+            clipboardUrl?.let { clipUrl ->
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Purple.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, Purple.copy(alpha = 0.35f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.ContentPaste, null, tint = Purple, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Link in clipboard", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Purple)
+                            Text(
+                                clipUrl,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                initialUrlForDialog = clipUrl
+                                showAddDialog = true
+                                clipboardUrl = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Purple),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.height(28.dp),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text("Download", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                        IconButton(
+                            onClick = { clipboardUrl = null },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(Icons.Filled.Close, "Dismiss", modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+            }
 
             // ─── Filter Tabs: All, Queued, Downloading, Saved (Synced with Swipe Pager) ─
             TabRow(
@@ -208,7 +308,8 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                                 onCancel = { viewModel.cancel(item) },
                                 onDelete = { deleteTargetItem = item },
                                 onOpen = { viewModel.open(item) },
-                                onShowError = { errorDetailItem = item }
+                                onShowError = { errorDetailItem = item },
+                                onShowChecksum = { checksumTargetItem = item }
                             )
                         }
                         item { Spacer(Modifier.height(88.dp)) }
@@ -221,16 +322,39 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     // Dialogs
     if (showAddDialog) {
         AddDownloadDialog(
-            onDismiss = { showAddDialog = false },
+            initialUrl = initialUrlForDialog,
+            onDismiss = {
+                showAddDialog = false
+                initialUrlForDialog = null
+            },
             onAdd = { url, name, threads ->
                 viewModel.addDownload(url, name, threads)
                 showAddDialog = false
+                initialUrlForDialog = null
+            },
+            onAddBatch = { urls, threads ->
+                viewModel.addBatchDownloads(urls, threads)
+                showAddDialog = false
+                initialUrlForDialog = null
             }
         )
     }
-    if (showSettingsDialog) SettingsDialog(onDismiss = { showSettingsDialog = false })
+    if (showSettingsDialog) {
+        SettingsDialog(
+            settings = settings,
+            onUpdateSettings = { viewModel.updateSettings(it) },
+            onDismiss = { showSettingsDialog = false }
+        )
+    }
     errorDetailItem?.let { item ->
         ErrorDetailDialog(item = item, onDismiss = { errorDetailItem = null })
+    }
+    checksumTargetItem?.let { item ->
+        ChecksumDialog(
+            item = item,
+            onCalculateChecksums = { viewModel.calculateChecksums(it) },
+            onDismiss = { checksumTargetItem = null }
+        )
     }
     deleteTargetItem?.let { item ->
         DeleteConfirmationDialog(
@@ -280,6 +404,73 @@ private fun StatChip(label: String, value: String, color: Color) {
     }
 }
 
+// ─── IDM-Style Segmented Progress Visualizer ──────────────────────────────────
+@Composable
+fun MultiThreadSegmentVisualizer(
+    threads: Int,
+    partProgress: List<Float>,
+    statusColor: Color
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Layers, null, tint = Purple, modifier = Modifier.size(13.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    "Multi-Thread Streams ($threads Threads)",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            val finished = partProgress.count { it >= 1.0f }
+            Text(
+                "$finished/$threads finished",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (finished == threads) Green else Purple
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            horizontalArrangement = Arrangement.spacedBy(1.5.dp)
+        ) {
+            val displayCount = if (partProgress.isNotEmpty()) partProgress.size else threads
+            for (i in 0 until displayCount) {
+                val p = partProgress.getOrNull(i) ?: 0f
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(1.dp))
+                        .background(
+                            when {
+                                p >= 1.0f -> Green
+                                p > 0f -> statusColor.copy(alpha = 0.35f + (p * 0.65f))
+                                else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)
+                            }
+                        )
+                )
+            }
+        }
+    }
+}
+
 // ─── Download Card ────────────────────────────────────────────────────────────
 @Composable
 fun DownloadCard(
@@ -289,7 +480,8 @@ fun DownloadCard(
     onCancel: () -> Unit,
     onDelete: () -> Unit,
     onOpen: () -> Unit,
-    onShowError: () -> Unit
+    onShowError: () -> Unit,
+    onShowChecksum: () -> Unit
 ) {
     val statusColor = statusColor(item.status)
     val isActive = item.status == DownloadStatus.DOWNLOADING
@@ -326,6 +518,14 @@ fun DownloadCard(
                     Spacer(Modifier.height(3.dp))
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         StatusBadge(item.status, statusColor)
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text("📁 ${item.category}", color = MaterialTheme.colorScheme.primary, fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
+                        }
                         if (item.threads > 1 && (isActive || isPaused)) {
                             Surface(color = Purple.copy(0.13f), shape = RoundedCornerShape(4.dp)) {
                                 Text("⚡${item.threads}T", color = Purple, fontSize = 10.sp,
@@ -349,7 +549,17 @@ fun DownloadCard(
                     trackColor = statusColor.copy(alpha = 0.15f),
                     strokeCap = StrokeCap.Round
                 )
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(8.dp))
+
+                // IDM-style Segmented Progress Visualizer
+                if (item.threads > 1) {
+                    MultiThreadSegmentVisualizer(
+                        threads = item.threads,
+                        partProgress = item.partProgress,
+                        statusColor = statusColor
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
 
                 // ─ Speed + ETA banner (the important new section) ──────────
                 if (isActive) {
@@ -484,6 +694,8 @@ fun DownloadCard(
                     }
                     DownloadStatus.COMPLETED -> {
                         ActionBtn("Open",   Icons.AutoMirrored.Filled.OpenInNew, Green, onOpen)
+                        Spacer(Modifier.width(8.dp))
+                        ActionBtn("Hash",   Icons.Filled.VerifiedUser, Purple, onShowChecksum)
                         Spacer(Modifier.width(8.dp))
                         ActionBtn("Delete", Icons.Filled.Delete,                 Red,   onDelete)
                     }
@@ -659,14 +871,30 @@ fun DeleteConfirmationDialog(
     )
 }
 
-// ─── Add Download Dialog ──────────────────────────────────────────────────────
+// ─── Add Download Dialog (Single Link & Batch Downloads) ──────────────────────
 @Composable
-fun AddDownloadDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String, threads: Int) -> Unit) {
-    var url by remember { mutableStateOf("") }
+fun AddDownloadDialog(
+    initialUrl: String? = null,
+    onDismiss: () -> Unit,
+    onAdd: (url: String, name: String, threads: Int) -> Unit,
+    onAddBatch: (urls: List<String>, threads: Int) -> Unit
+) {
+    var selectedTab by remember { mutableStateOf(0) }
+    var url by remember { mutableStateOf(initialUrl ?: "") }
     var fileName by remember { mutableStateOf("") }
     var threads by remember { mutableStateOf(16) }
     var urlError by remember { mutableStateOf("") }
+
+    var batchText by remember { mutableStateOf("") }
     val clipboardManager = LocalClipboardManager.current
+
+    // Extract valid URLs from multi-line batch text
+    val parsedBatchUrls = remember(batchText) {
+        batchText.lines()
+            .map { it.trim() }
+            .filter { it.startsWith("http://") || it.startsWith("https://") }
+            .distinct()
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -678,71 +906,160 @@ fun AddDownloadDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String, 
             }
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                OutlinedTextField(
-                    value = url,
-                    onValueChange = { newUrl ->
-                        url = newUrl
-                        urlError = ""
-                        if (fileName.isBlank()) {
-                            try {
-                                val clean = newUrl.trim()
-                                val candidate = clean.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                                if (candidate.isNotBlank() && candidate.contains(".")) {
-                                    fileName = java.net.URLDecoder.decode(candidate, "UTF-8")
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    },
-                    label = { Text("Download URL *") },
-                    placeholder = { Text("https://example.com/file.zip") },
-                    isError = urlError.isNotEmpty(),
-                    supportingText = if (urlError.isNotEmpty()) {{ Text(urlError, color = Red) }} else null,
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    leadingIcon = { Icon(Icons.Filled.Link, null) },
-                    trailingIcon = {
-                        IconButton(onClick = {
-                            val clipText = clipboardManager.getText()?.text?.trim() ?: ""
-                            if (clipText.isNotBlank()) {
-                                url = clipText
-                                urlError = ""
-                                if (fileName.isBlank()) {
-                                    try {
-                                        val candidate = clipText.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                                        if (candidate.isNotBlank() && candidate.contains(".")) {
-                                            fileName = java.net.URLDecoder.decode(candidate, "UTF-8")
-                                        }
-                                    } catch (_: Exception) {}
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                // Single vs Batch Tab Selector
+                TabRow(
+                    selectedTabIndex = selectedTab,
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    contentColor = Purple,
+                    modifier = Modifier.clip(RoundedCornerShape(8.dp))
+                ) {
+                    Tab(
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
+                        text = { Text("Single Link", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                    )
+                    Tab(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        text = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Batch Links", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                if (parsedBatchUrls.isNotEmpty()) {
+                                    Spacer(Modifier.width(4.dp))
+                                    Surface(color = Purple, shape = CircleShape) {
+                                        Text(" ${parsedBatchUrls.size} ", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                    }
                                 }
                             }
-                        }) {
-                            Icon(Icons.Filled.ContentPaste, "Paste URL", tint = Purple)
+                        }
+                    )
+                }
+
+                if (selectedTab == 0) {
+                    // ── Single Link Mode ──
+                    OutlinedTextField(
+                        value = url,
+                        onValueChange = { newUrl ->
+                            url = newUrl
+                            urlError = ""
+                            if (fileName.isBlank()) {
+                                try {
+                                    val clean = newUrl.trim()
+                                    val candidate = clean.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                                    if (candidate.isNotBlank() && candidate.contains(".")) {
+                                        fileName = java.net.URLDecoder.decode(candidate, "UTF-8")
+                                    }
+                                } catch (_: Exception) {}
+                            }
+                        },
+                        label = { Text("Download URL *") },
+                        placeholder = { Text("https://example.com/file.zip") },
+                        isError = urlError.isNotEmpty(),
+                        supportingText = if (urlError.isNotEmpty()) {{ Text(urlError, color = Red) }} else null,
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        leadingIcon = { Icon(Icons.Filled.Link, null) },
+                        trailingIcon = {
+                            IconButton(onClick = {
+                                val clipText = clipboardManager.getText()?.text?.trim() ?: ""
+                                if (clipText.isNotBlank()) {
+                                    url = clipText
+                                    urlError = ""
+                                    if (fileName.isBlank()) {
+                                        try {
+                                            val candidate = clipText.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                                            if (candidate.isNotBlank() && candidate.contains(".")) {
+                                                fileName = java.net.URLDecoder.decode(candidate, "UTF-8")
+                                            }
+                                        } catch (_: Exception) {}
+                                    }
+                                }
+                            }) {
+                                Icon(Icons.Filled.ContentPaste, "Paste URL", tint = Purple)
+                            }
+                        }
+                    )
+                    OutlinedTextField(
+                        value = fileName,
+                        onValueChange = { fileName = it },
+                        label = { Text("File Name (optional)") },
+                        placeholder = { Text("Auto-detected from URL") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.InsertDriveFile, null) }
+                    )
+                } else {
+                    // ── Batch Download Mode ──
+                    OutlinedTextField(
+                        value = batchText,
+                        onValueChange = { batchText = it },
+                        label = { Text("Paste Links (1 per line)") },
+                        placeholder = { Text("https://example.com/file1.zip\nhttps://example.com/file2.mkv\nhttps://example.com/file3.mp4") },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 4,
+                        maxLines = 6,
+                        trailingIcon = {
+                            IconButton(onClick = {
+                                val clipText = clipboardManager.getText()?.text?.trim() ?: ""
+                                if (clipText.isNotBlank()) {
+                                    batchText = if (batchText.isBlank()) clipText else "$batchText\n$clipText"
+                                }
+                            }) {
+                                Icon(Icons.Filled.ContentPaste, "Paste", tint = Purple)
+                            }
+                        }
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            color = if (parsedBatchUrls.isNotEmpty()) Green.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceVariant,
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                " ${parsedBatchUrls.size} links detected ",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (parsedBatchUrls.isNotEmpty()) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                            )
+                        }
+                        if (batchText.isNotBlank()) {
+                            TextButton(onClick = { batchText = "" }) {
+                                Text("Clear", fontSize = 11.sp, color = Red)
+                            }
                         }
                     }
-                )
-                OutlinedTextField(
-                    value = fileName,
-                    onValueChange = { fileName = it },
-                    label = { Text("File Name (optional)") },
-                    placeholder = { Text("Auto-detected from URL") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.InsertDriveFile, null) }
-                )
+                }
+
+                // Threads slider & presets (shared for both modes)
                 Column {
-                    Row(modifier = Modifier.fillMaxWidth(),
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically) {
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Filled.Speed, null, tint = Purple, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("Download Threads", fontWeight = FontWeight.Medium)
+                            Text(
+                                if (selectedTab == 0) "Download Threads" else "Threads per Download",
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp
+                            )
                         }
                         Surface(color = Purple.copy(0.15f), shape = RoundedCornerShape(8.dp)) {
-                            Text("  $threads  ", fontWeight = FontWeight.ExtraBold, color = Purple,
-                                fontSize = 18.sp, modifier = Modifier.padding(vertical = 2.dp))
+                            Text(
+                                "  $threads  ",
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Purple,
+                                fontSize = 16.sp,
+                                modifier = Modifier.padding(vertical = 2.dp)
+                            )
                         }
                     }
                     Slider(
@@ -758,7 +1075,7 @@ fun AddDownloadDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String, 
                         Text("64 (Ultra)", fontSize = 10.sp, color = Purple)
                         Text("100 (Hyper 🚀)", fontSize = 10.sp, color = Purple, fontWeight = FontWeight.Bold)
                     }
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(6.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -788,57 +1105,302 @@ fun AddDownloadDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String, 
             }
         },
         confirmButton = {
-            Button(
-                onClick = {
-                    var cleaned = url.trim()
-                    val httpsIdx = cleaned.indexOf("https://")
-                    val httpIdx = cleaned.indexOf("http://")
-                    if (httpsIdx >= 0) {
-                        cleaned = cleaned.substring(httpsIdx)
-                    } else if (httpIdx >= 0) {
-                        cleaned = cleaned.substring(httpIdx)
-                    }
+            if (selectedTab == 0) {
+                Button(
+                    onClick = {
+                        var cleaned = url.trim()
+                        val httpsIdx = cleaned.indexOf("https://")
+                        val httpIdx = cleaned.indexOf("http://")
+                        if (httpsIdx >= 0) cleaned = cleaned.substring(httpsIdx)
+                        else if (httpIdx >= 0) cleaned = cleaned.substring(httpIdx)
 
-                    if (cleaned.isBlank()) { urlError = "URL cannot be empty"; return@Button }
-                    if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
-                        urlError = "URL must start with http:// or https://"; return@Button
-                    }
-                    val name = fileName.ifBlank {
-                        cleaned.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                            .ifBlank { "download_${System.currentTimeMillis()}" }
-                    }
-                    onAdd(cleaned, name, threads)
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = Purple)
-            ) {
-                Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Start Download", fontWeight = FontWeight.Bold)
+                        if (cleaned.isBlank()) { urlError = "URL cannot be empty"; return@Button }
+                        if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
+                            urlError = "URL must start with http:// or https://"; return@Button
+                        }
+                        val name = fileName.ifBlank {
+                            cleaned.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                                .ifBlank { "download_${System.currentTimeMillis()}" }
+                        }
+                        onAdd(cleaned, name, threads)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                ) {
+                    Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Start Download", fontWeight = FontWeight.Bold)
+                }
+            } else {
+                Button(
+                    onClick = {
+                        if (parsedBatchUrls.isNotEmpty()) {
+                            onAddBatch(parsedBatchUrls, threads)
+                        }
+                    },
+                    enabled = parsedBatchUrls.isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                ) {
+                    Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Start Batch (${parsedBatchUrls.size})", fontWeight = FontWeight.Bold)
+                }
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
 }
 
-// ─── Settings Dialog ──────────────────────────────────────────────────────────
+// ─── Checksum Verifier Dialog (MD5 & SHA-256) ─────────────────────────────────
 @Composable
-fun SettingsDialog(onDismiss: () -> Unit) {
+fun ChecksumDialog(
+    item: DownloadItem,
+    onCalculateChecksums: suspend (String) -> Pair<String, String>,
+    onDismiss: () -> Unit
+) {
+    var md5Hash by remember { mutableStateOf("Calculating...") }
+    var sha256Hash by remember { mutableStateOf("Calculating...") }
+    var isCalculating by remember { mutableStateOf(true) }
+    var compareInput by remember { mutableStateOf("") }
+    val clipboardManager = LocalClipboardManager.current
+
+    LaunchedEffect(item.filePath) {
+        try {
+            val (md5, sha256) = onCalculateChecksums(item.filePath)
+            md5Hash = md5
+            sha256Hash = sha256
+        } catch (e: Exception) {
+            md5Hash = "Error: ${e.message}"
+            sha256Hash = "Error: ${e.message}"
+        } finally {
+            isCalculating = false
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Settings", fontWeight = FontWeight.Bold) },
+        icon = { Icon(Icons.Filled.VerifiedUser, null, tint = Purple, modifier = Modifier.size(28.dp)) },
+        title = { Text("File Checksum Verifier", fontWeight = FontWeight.Bold) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(
-                    "📂 Downloads saved to: /Downloads/",
-                    "⚡ Max threads: Up to 100 per download (Hyper Speed 🚀)",
-                    "📡 Uses HTTP Range requests for multi-threading",
-                    "🔁 Auto-retry: Retry button on failed downloads",
-                    "⏸️ Resume: Downloads continue from where they stopped",
-                    "🔒 Requires direct download links (not web pages)"
-                ).forEach { Text(it, fontSize = 13.sp) }
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(8.dp)) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(item.fileName, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(formatSize(item.downloadedSize), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+
+                if (isCalculating) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Purple)
+                        Spacer(Modifier.width(10.dp))
+                        Text("Calculating cryptographic hashes...", fontSize = 12.sp)
+                    }
+                } else {
+                    // MD5 block
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("MD5", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Purple)
+                                IconButton(onClick = { clipboardManager.setText(AnnotatedString(md5Hash)) }, modifier = Modifier.size(22.dp)) {
+                                    Icon(Icons.Filled.ContentCopy, "Copy MD5", modifier = Modifier.size(14.dp), tint = Purple)
+                                }
+                            }
+                            Text(md5Hash, fontSize = 11.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                        }
+                    }
+
+                    // SHA-256 block
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("SHA-256", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = Purple)
+                                IconButton(onClick = { clipboardManager.setText(AnnotatedString(sha256Hash)) }, modifier = Modifier.size(22.dp)) {
+                                    Icon(Icons.Filled.ContentCopy, "Copy SHA-256", modifier = Modifier.size(14.dp), tint = Purple)
+                                }
+                            }
+                            Text(sha256Hash, fontSize = 10.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+
+                    // Compare block
+                    OutlinedTextField(
+                        value = compareInput,
+                        onValueChange = { compareInput = it.trim() },
+                        label = { Text("Compare Expected Hash") },
+                        placeholder = { Text("Paste expected MD5 or SHA-256") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        trailingIcon = {
+                            if (compareInput.isNotBlank()) {
+                                IconButton(onClick = { compareInput = "" }) {
+                                    Icon(Icons.Filled.Clear, "Clear", modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+                    )
+
+                    if (compareInput.isNotBlank()) {
+                        val matches = compareInput.equals(md5Hash, ignoreCase = true) ||
+                                compareInput.equals(sha256Hash, ignoreCase = true)
+                        Surface(
+                            color = if (matches) Green.copy(0.12f) else Red.copy(0.12f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    if (matches) Icons.Filled.CheckCircle else Icons.Filled.Error,
+                                    null,
+                                    tint = if (matches) Green else Red,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    if (matches) "✓ Hash Matched! File is authentic & verified." else "✗ Hash Mismatch! Checksum does not match.",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (matches) Green else Red
+                                )
+                            }
+                        }
+                    }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } }
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
+// ─── Settings Dialog ──────────────────────────────────────────────────────────
+@Composable
+fun SettingsDialog(
+    settings: DownloadSettings,
+    onUpdateSettings: (DownloadSettings) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Settings, null, tint = Purple)
+                Spacer(Modifier.width(8.dp))
+                Text("Settings & Queue", fontWeight = FontWeight.Bold)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
+                // Wi-Fi Only Switch
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Wifi, null, tint = Purple, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Download on Wi-Fi Only", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        }
+                        Text("Pause/queue downloads on mobile data", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = settings.wifiOnly,
+                        onCheckedChange = { onUpdateSettings(settings.copy(wifiOnly = it)) }
+                    )
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
+
+                // Auto Categorize Switch
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Folder, null, tint = Purple, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Auto-Categorize Folders", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        }
+                        Text("Sort into SpeedDown/Videos, Music, etc.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = settings.autoCategorize,
+                        onCheckedChange = { onUpdateSettings(settings.copy(autoCategorize = it)) }
+                    )
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
+
+                // Max Concurrent Active Downloads
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Queue, null, tint = Purple, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Max Concurrent Active Downloads", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text("Excess downloads stay Queued and auto-start on finish", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(1, 2, 3, 5, 0).forEach { limit ->
+                            val label = if (limit == 0) "All" else "$limit"
+                            val isSel = settings.maxConcurrent == limit
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (isSel) Purple else MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(32.dp)
+                                    .clickable { onUpdateSettings(settings.copy(maxConcurrent = limit)) }
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(
+                                        label,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isSel) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(0.4f))
+
+                // Info items
+                listOf(
+                    "⚡ Multi-Threading: Up to 100 threads per file",
+                    "📂 Storage: /Download/SpeedDown/",
+                    "🌐 Built-in Media Sniffer Browser supported"
+                ).forEach {
+                    Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done", fontWeight = FontWeight.Bold) } }
     )
 }
 
