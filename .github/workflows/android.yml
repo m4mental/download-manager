@@ -26,13 +26,27 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Decode Release Keystore
-        if: env.KEYSTORE_BASE64 != ''
+      - name: Setup Keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           mkdir -p keystore
-          echo "$KEYSTORE_BASE64" | base64 -d > keystore/speeddown-release.jks
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > keystore/speeddown-release.jks
+          fi
+          # Fallback: if keystore is missing or 0-byte, generate a valid 2048-bit release key automatically
+          if [ ! -s keystore/speeddown-release.jks ]; then
+            echo "Generating automated release signing key..."
+            keytool -genkeypair -v \
+              -keystore keystore/speeddown-release.jks \
+              -alias speeddown \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass speeddown123 \
+              -keypass speeddown123 \
+              -dname "CN=SpeedDown, OU=Mobile, O=SpeedDown, L=San Francisco, S=CA, C=US"
+          fi
 
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew

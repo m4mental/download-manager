@@ -18,7 +18,7 @@ android {
     signingConfigs {
         create("release") {
             val ksFile = rootProject.file("keystore/speeddown-release.jks")
-            if (ksFile.exists()) {
+            if (ksFile.exists() && ksFile.length() > 0L) {
                 storeFile = ksFile
                 storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "speeddown123"
                 keyAlias = System.getenv("KEY_ALIAS") ?: "speeddown"
