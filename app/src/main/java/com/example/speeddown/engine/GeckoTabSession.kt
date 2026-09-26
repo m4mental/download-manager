@@ -21,7 +21,8 @@ class GeckoTabSession(
     private val onNewTabRequested: (String) -> Unit,
     private val onMediaSniffed: (String) -> Unit,
     private val onDownloadRequested: (url: String, fileName: String, threads: Int) -> Unit,
-    private val onAdBlocked: () -> Unit = {}
+    private val onAdBlocked: () -> Unit = {},
+    private val onFullScreenChanged: (Boolean) -> Unit = {}
 ) {
     val session: GeckoSession
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -178,6 +179,12 @@ class GeckoTabSession(
                 title?.let { onTitleChanged(it) }
             }
 
+            override fun onFullScreen(s: GeckoSession, fullScreen: Boolean) {
+                mainHandler.post {
+                    onFullScreenChanged(fullScreen)
+                }
+            }
+
             override fun onExternalResponse(s: GeckoSession, response: WebResponse) {
                 val downloadUrl = response.uri
                 val disposition = response.headers["content-disposition"] ?: ""
@@ -194,6 +201,12 @@ class GeckoTabSession(
         // Open session with the shared GeckoRuntime
         val runtime = GeckoEngine.getOrCreateRuntime(context)
         session.open(runtime)
+    }
+
+    fun exitFullScreen() {
+        try {
+            session.exitFullScreen()
+        } catch (_: Exception) {}
     }
 
     fun loadUri(uri: String) {

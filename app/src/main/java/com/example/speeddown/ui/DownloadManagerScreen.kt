@@ -18,6 +18,7 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -60,9 +61,9 @@ enum class DownloadTab(val title: String) {
 @Composable
 fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    var showBrowser by remember { mutableStateOf(false) }
-    var navigatedFromBrowser by remember { mutableStateOf(false) }
-    var showSettingsScreen by remember { mutableStateOf(false) }
+    var showBrowser by rememberSaveable { mutableStateOf(false) }
+    var navigatedFromBrowser by rememberSaveable { mutableStateOf(false) }
+    var showSettingsScreen by rememberSaveable { mutableStateOf(false) }
 
     // When user jumped from browser to downloads screen, back gesture returns smoothly back to browser!
     BackHandler(enabled = !showBrowser && !showSettingsScreen && navigatedFromBrowser) {

@@ -1,13 +1,18 @@
 package com.example.speeddown.ui.browser
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.*
@@ -36,6 +41,7 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -277,7 +283,7 @@ fun BrowserScreen(
 
     // Persistent multi-tab session across screen navigation and app restarts
     val tabs = BrowserSessionManager.getOrCreateTabs(context, initialUrl, browserSettings.defaultDesktopMode)
-    var activeTabId by remember { mutableStateOf(BrowserSessionManager.activeTabId.ifBlank { tabs.first().id }) }
+    var activeTabId by rememberSaveable { mutableStateOf(BrowserSessionManager.activeTabId.ifBlank { tabs.first().id }) }
     LaunchedEffect(activeTabId) {
         BrowserSessionManager.activeTabId = activeTabId
         BrowserSessionManager.saveSession(context)
@@ -299,6 +305,33 @@ fun BrowserScreen(
     var customFullscreenView by remember { mutableStateOf<View?>(null) }
     var customFullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
     var pendingDownload by remember { mutableStateOf<PendingBrowserDownload?>(null) }
+    var isGeckoFullScreen by remember { mutableStateOf(false) }
+
+    val activity = context as? Activity
+    LaunchedEffect(isGeckoFullScreen) {
+        activity?.let { act ->
+            val window = act.window
+            val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+            if (isGeckoFullScreen) {
+                insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                insetsController.hide(WindowInsetsCompat.Type.systemBars())
+                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            } else {
+                insetsController.show(WindowInsetsCompat.Type.systemBars())
+                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            activity?.let { act ->
+                val insetsController = WindowCompat.getInsetsController(act.window, act.window.decorView)
+                insetsController.show(WindowInsetsCompat.Type.systemBars())
+                act.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        }
+    }
 
     // HLS Multi-Quality Picker State
     var hlsVariantsToPick by remember { mutableStateOf<List<HlsStreamVariant>?>(null) }
@@ -310,7 +343,10 @@ fun BrowserScreen(
 
     // Predictive Back Gesture & Hierarchical In-App Navigation
     BackHandler(enabled = true) {
-        if (pendingDownload != null) {
+        if (isGeckoFullScreen) {
+            currentTab.geckoTabSession?.exitFullScreen()
+            isGeckoFullScreen = false
+        } else if (pendingDownload != null) {
             pendingDownload = null
         } else if (showMoreMenu) {
             showMoreMenu = false
@@ -408,11 +444,13 @@ fun BrowserScreen(
     // Keep inputUrl synced when activeTab changes
     LaunchedEffect(activeTabId) {
         inputUrl = if (currentTab.url == "speeddown://home") "" else currentTab.url
+        isGeckoFullScreen = false
     }
 
     Scaffold(
         topBar = {
-            TopAppBar(
+            if (!isGeckoFullScreen) {
+                TopAppBar(
                 title = {
                     val isHome = currentTab.url == "speeddown://home" || currentTab.url.isEmpty() || currentTab.url == "about:blank"
                     if (isHome) {
@@ -592,9 +630,11 @@ fun BrowserScreen(
                     containerColor = if (currentTab.isIncognito) Color(0xFF1E1B2E) else MaterialTheme.colorScheme.surface
                 )
             )
+            }
         },
         bottomBar = {
-            Surface(
+            if (!isGeckoFullScreen) {
+                Surface(
                 color = MaterialTheme.colorScheme.surface,
                 shadowElevation = 8.dp,
                 modifier = Modifier.fillMaxWidth()
@@ -965,14 +1005,13 @@ fun BrowserScreen(
                     }
                 }
             }
+            }
         }
     ) { padding ->
         Column(
-            modifier = Modifier
-                .padding(padding)
-                .fillMaxSize()
+            modifier = if (isGeckoFullScreen) Modifier.fillMaxSize() else Modifier.padding(padding).fillMaxSize()
         ) {
-            if (currentTab.webProgress in 1..99) {
+            if (!isGeckoFullScreen && currentTab.webProgress in 1..99) {
                 LinearProgressIndicator(
                     progress = { currentTab.webProgress / 100f },
                     modifier = Modifier
@@ -1074,6 +1113,9 @@ fun BrowserScreen(
                                 },
                                 onAdBlocked = {
                                     blockedCountState = AdBlockEngine.blockedAdsCount
+                                },
+                                onFullScreenChanged = { fullScreen ->
+                                    isGeckoFullScreen = fullScreen
                                 }
                             )
                             if (currentTab.url.startsWith("http://") || currentTab.url.startsWith("https://")) {
