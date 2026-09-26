@@ -20,3 +20,13 @@
 -keepattributes SourceFile,LineNumberTable
 -keep public class * extends android.app.Service
 -keep public class * extends android.content.BroadcastReceiver
+
+# SnakeYAML & java.beans (Suppress desktop-only java.beans warnings on Android)
+-dontwarn java.beans.**
+-dontwarn org.yaml.snakeyaml.**
+
+# Mozilla GeckoView
+-keep class org.mozilla.gecko.** { *; }
+-keep class org.mozilla.geckoview.** { *; }
+-dontwarn org.mozilla.geckoview.**
+-dontwarn org.mozilla.gecko.**
