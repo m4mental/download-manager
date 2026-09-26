@@ -46,6 +46,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import android.widget.Toast
 import androidx.compose.ui.unit.dp
@@ -102,20 +103,95 @@ object BrowserSessionManager {
     var activeTabId by mutableStateOf("")
     private var isInitialized = false
 
-    fun getOrCreateTabs(initialUrl: String = "speeddown://home", defaultDesktop: Boolean = false): MutableList<BrowserTabItem> {
+    private const val PREFS_NAME = "speeddown_browser_tabs_session"
+    private const val KEY_TABS_JSON = "tabs_json"
+    private const val KEY_ACTIVE_TAB_ID = "active_tab_id"
+
+    fun getOrCreateTabs(
+        context: Context,
+        initialUrl: String = "speeddown://home",
+        defaultDesktop: Boolean = false
+    ): MutableList<BrowserTabItem> {
         if (!isInitialized || tabs.isEmpty()) {
-            val firstTab = BrowserTabItem(initialUrl = initialUrl).apply {
-                isDesktopMode = defaultDesktop
-            }
+            val restored = restoreSession(context, defaultDesktop)
             tabs.clear()
-            tabs.add(firstTab)
-            activeTabId = firstTab.id
+            if (restored.isNotEmpty()) {
+                tabs.addAll(restored)
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val savedActiveId = prefs.getString(KEY_ACTIVE_TAB_ID, "") ?: ""
+                activeTabId = if (tabs.any { it.id == savedActiveId }) savedActiveId else tabs.first().id
+
+                // If an explicit non-home URL was requested (e.g. from an intent) that isn't already open
+                if (initialUrl != "speeddown://home" && initialUrl.isNotBlank() && tabs.none { it.url == initialUrl }) {
+                    val newTab = BrowserTabItem(initialUrl = initialUrl).apply {
+                        isDesktopMode = defaultDesktop
+                    }
+                    tabs.add(newTab)
+                    activeTabId = newTab.id
+                }
+            } else {
+                val firstTab = BrowserTabItem(initialUrl = initialUrl).apply {
+                    isDesktopMode = defaultDesktop
+                }
+                tabs.add(firstTab)
+                activeTabId = firstTab.id
+            }
             isInitialized = true
         }
         return tabs
     }
 
-    fun removeTab(tab: BrowserTabItem) {
+    fun saveSession(context: Context) {
+        try {
+            val nonIncognitoTabs = tabs.filter { !it.isIncognito }
+            if (nonIncognitoTabs.isEmpty()) return
+
+            val arr = org.json.JSONArray()
+            nonIncognitoTabs.forEach { tab ->
+                val currentUrl = if (tab.url.isNotBlank()) tab.url else (tab.webView?.url ?: "speeddown://home")
+                val obj = org.json.JSONObject().apply {
+                    put("id", tab.id)
+                    put("url", currentUrl)
+                    put("title", tab.title)
+                    put("isDesktopMode", tab.isDesktopMode)
+                }
+                arr.put(obj)
+            }
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_TABS_JSON, arr.toString())
+                .putString(KEY_ACTIVE_TAB_ID, activeTabId)
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun restoreSession(context: Context, defaultDesktop: Boolean): List<BrowserTabItem> {
+        try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val jsonStr = prefs.getString(KEY_TABS_JSON, null) ?: return emptyList()
+            val arr = org.json.JSONArray(jsonStr)
+            val list = mutableListOf<BrowserTabItem>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val id = obj.optString("id", UUID.randomUUID().toString())
+                val url = obj.optString("url", "speeddown://home")
+                val title = obj.optString("title", "SpeedDown Home")
+                val isDesktop = obj.optBoolean("isDesktopMode", defaultDesktop)
+
+                val tab = BrowserTabItem(id = id, initialUrl = url).apply {
+                    this.title = title
+                    this.url = url
+                    this.isDesktopMode = isDesktop
+                }
+                list.add(tab)
+            }
+            return list
+        } catch (_: Exception) {
+            return emptyList()
+        }
+    }
+
+    fun removeTab(context: Context?, tab: BrowserTabItem) {
         val index = tabs.indexOf(tab)
         tab.webView?.let { wv ->
             (wv.parent as? ViewGroup)?.removeView(wv)
@@ -132,9 +208,12 @@ object BrowserSessionManager {
             val nextIndex = (index - 1).coerceAtLeast(0)
             activeTabId = tabs[nextIndex].id
         }
+        if (context != null) {
+            saveSession(context)
+        }
     }
 
-    fun clearAll() {
+    fun clearAll(context: Context?) {
         tabs.forEach { tab ->
             tab.webView?.let { wv ->
                 (wv.parent as? ViewGroup)?.removeView(wv)
@@ -145,8 +224,22 @@ object BrowserSessionManager {
         }
         tabs.clear()
         isInitialized = false
+        if (context != null) {
+            try {
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .clear()
+                    .apply()
+            } catch (_: Exception) {}
+        }
     }
 }
+
+data class PendingBrowserDownload(
+    val url: String,
+    val initialFileName: String,
+    val initialThreads: Int = 16
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
@@ -154,6 +247,7 @@ object BrowserSessionManager {
 fun BrowserScreen(
     initialUrl: String = "speeddown://home",
     onClose: () -> Unit,
+    onNavigateToDownloads: () -> Unit = onClose,
     onStartDownload: (url: String, fileName: String, threads: Int) -> Unit
 ) {
     val context = LocalContext.current
@@ -169,11 +263,12 @@ fun BrowserScreen(
     val browserSettings by browserSettingsStore.settings.collectAsState(initial = BrowserSettings())
     val shortcuts by browserSettingsStore.shortcuts.collectAsState(initial = emptyList())
 
-    // Persistent in-memory multi-tab session across screen navigation
-    val tabs = BrowserSessionManager.getOrCreateTabs(initialUrl, browserSettings.defaultDesktopMode)
+    // Persistent multi-tab session across screen navigation and app restarts
+    val tabs = BrowserSessionManager.getOrCreateTabs(context, initialUrl, browserSettings.defaultDesktopMode)
     var activeTabId by remember { mutableStateOf(BrowserSessionManager.activeTabId.ifBlank { tabs.first().id }) }
     LaunchedEffect(activeTabId) {
         BrowserSessionManager.activeTabId = activeTabId
+        BrowserSessionManager.saveSession(context)
     }
     val currentTab = tabs.find { it.id == activeTabId } ?: tabs.first()
     val coroutineScope = rememberCoroutineScope()
@@ -191,6 +286,7 @@ fun BrowserScreen(
     var blockedCountState by remember { mutableIntStateOf(AdBlockEngine.blockedAdsCount) }
     var customFullscreenView by remember { mutableStateOf<View?>(null) }
     var customFullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+    var pendingDownload by remember { mutableStateOf<PendingBrowserDownload?>(null) }
 
     // HLS Multi-Quality Picker State
     var hlsVariantsToPick by remember { mutableStateOf<List<HlsStreamVariant>?>(null) }
@@ -202,7 +298,9 @@ fun BrowserScreen(
 
     // Predictive Back Gesture & Hierarchical In-App Navigation
     BackHandler(enabled = true) {
-        if (showMoreMenu) {
+        if (pendingDownload != null) {
+            pendingDownload = null
+        } else if (showMoreMenu) {
             showMoreMenu = false
         } else if (showBrowserSettings) {
             showBrowserSettings = false
@@ -286,6 +384,7 @@ fun BrowserScreen(
     // Detach WebViews cleanly when leaving BrowserScreen so they can safely reattach later without being destroyed
     DisposableEffect(Unit) {
         onDispose {
+            BrowserSessionManager.saveSession(context)
             tabs.forEach { tab ->
                 tab.webView?.let { wv ->
                     (wv.parent as? ViewGroup)?.removeView(wv)
@@ -438,7 +537,7 @@ fun BrowserScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onClose) {
+                    IconButton(onClick = onNavigateToDownloads) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to Downloads")
                     }
                 },
@@ -603,6 +702,38 @@ fun BrowserScreen(
                             expanded = showMoreMenu,
                             onDismissRequest = { showMoreMenu = false }
                         ) {
+                            // Downloads Manager Navigation
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("Downloads", fontWeight = FontWeight.Bold)
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.ArrowForward,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Filled.DownloadForOffline,
+                                        contentDescription = "Downloads",
+                                        tint = Purple
+                                    )
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    onNavigateToDownloads()
+                                }
+                            )
+
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
                             // Video Capture / Media Sniffer shifted inside 3-dot menu!
                             DropdownMenuItem(
                                 text = {
@@ -862,6 +993,18 @@ fun BrowserScreen(
                                 onAdBlocked = {
                                     blockedCountState = AdBlockEngine.blockedAdsCount
                                 },
+                                onOpenNewTab = { targetUrl ->
+                                    val newTab = BrowserTabItem(
+                                        initialUrl = targetUrl,
+                                        isIncognito = currentTab.isIncognito
+                                    ).apply {
+                                        isDesktopMode = browserSettings.defaultDesktopMode
+                                    }
+                                    tabs.add(newTab)
+                                    activeTabId = newTab.id
+                                    inputUrl = targetUrl
+                                    Toast.makeText(context, "Opened in new tab", Toast.LENGTH_SHORT).show()
+                                },
                                 onShowCustomView = { v, callback ->
                                     customFullscreenView = v
                                     customFullscreenCallback = callback
@@ -871,7 +1014,9 @@ fun BrowserScreen(
                                     customFullscreenView = null
                                     customFullscreenCallback = null
                                 },
-                                onStartDownload = onStartDownload
+                                onRequestDownloadConfig = { url, fileName, threads ->
+                                    pendingDownload = PendingBrowserDownload(url, fileName, threads)
+                                }
                             )
                         }
 
@@ -894,6 +1039,20 @@ fun BrowserScreen(
                 )
             }
         }
+    }
+
+    // Interactive Download Configuration Dialog (Configure Filename and Threads before download starts)
+    pendingDownload?.let { download ->
+        BrowserDownloadConfigDialog(
+            url = download.url,
+            initialFileName = download.initialFileName,
+            defaultThreads = download.initialThreads,
+            onDismiss = { pendingDownload = null },
+            onConfirm = { editedFileName, selectedThreads ->
+                pendingDownload = null
+                onStartDownload(download.url, editedFileName, selectedThreads)
+            }
+        )
     }
 
     // Tabs Management Bottom Sheet
@@ -1463,14 +1622,14 @@ fun BrowserScreen(
                                                             hlsVariantsToPick = variants
                                                             hlsTargetMedia = media
                                                         } else {
-                                                            onStartDownload(media.url, media.fileName, 32)
                                                             showSnifferSheet = false
+                                                            pendingDownload = PendingBrowserDownload(media.url, media.fileName, 32)
                                                         }
                                                     }
                                                 }
                                             } else {
-                                                onStartDownload(media.url, media.fileName, 32)
                                                 showSnifferSheet = false
+                                                pendingDownload = PendingBrowserDownload(media.url, media.fileName, 32)
                                             }
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = Purple),
@@ -1539,7 +1698,7 @@ fun BrowserScreen(
                         val name = pMedia.fileName
                         previewMedia = null
                         showSnifferSheet = false
-                        onStartDownload(url, name, 32)
+                        pendingDownload = PendingBrowserDownload(url, name, 32)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Purple)
                 ) {
@@ -1598,7 +1757,7 @@ fun BrowserScreen(
                                         if (target != null) {
                                             val cleanName = target.fileName.substringBeforeLast(".")
                                             val qualitySuffix = variant.label.replace(" ", "_")
-                                            onStartDownload(variant.url, "${cleanName}_$qualitySuffix.mp4", 32)
+                                            pendingDownload = PendingBrowserDownload(variant.url, "${cleanName}_$qualitySuffix.mp4", 32)
                                         }
                                     }
                             ) {
@@ -1685,9 +1844,10 @@ private fun createTabWebView(
     detectedMedia: MutableList<SniffedMedia>,
     onUrlChanged: (String) -> Unit,
     onAdBlocked: () -> Unit,
+    onOpenNewTab: (String) -> Unit,
     onShowCustomView: (View, WebChromeClient.CustomViewCallback) -> Unit,
     onHideCustomView: () -> Unit,
-    onStartDownload: (url: String, fileName: String, threads: Int) -> Unit
+    onRequestDownloadConfig: (url: String, fileName: String, threads: Int) -> Unit
 ): WebView {
     return WebView(context).apply {
         layoutParams = ViewGroup.LayoutParams(
@@ -1713,9 +1873,26 @@ private fun createTabWebView(
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             allowFileAccess = !tab.isIncognito
             allowContentAccess = true
-            cacheMode = if (tab.isIncognito) WebSettings.LOAD_NO_CACHE else WebSettings.LOAD_DEFAULT
-            setSupportMultipleWindows(false) // Blocks rogue popup window spawns
-            javaScriptCanOpenWindowsAutomatically = !browserSettings.blockPopups && false
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            val isConnected = try {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    val network = cm?.activeNetwork
+                    val caps = cm?.getNetworkCapabilities(network)
+                    caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+                } else {
+                    @Suppress("DEPRECATION")
+                    cm?.activeNetworkInfo?.isConnected == true
+                }
+            } catch (_: Exception) { true }
+            cacheMode = if (tab.isIncognito) {
+                WebSettings.LOAD_NO_CACHE
+            } else if (isConnected) {
+                WebSettings.LOAD_DEFAULT
+            } else {
+                WebSettings.LOAD_CACHE_ELSE_NETWORK
+            }
+            setSupportMultipleWindows(true) // Enable support for multiple windows / new tabs
+            javaScriptCanOpenWindowsAutomatically = true
             userAgentString = if (tab.isDesktopMode) DESKTOP_UA else MOBILE_UA
         }
 
@@ -1724,6 +1901,30 @@ private fun createTabWebView(
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(!tab.isIncognito)
         cookieManager.setAcceptThirdPartyCookies(currentWebView, browserSettings.acceptThirdPartyCookies && !tab.isIncognito)
+
+        // Native Download Listener for binary MIME types, Content-Disposition attachments, and server downloads
+        setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
+            val guessedName = try {
+                val guessed = URLUtil.guessFileName(url, contentDisposition, mimetype)
+                if (guessed.isNotBlank() && !guessed.endsWith(".bin")) {
+                    guessed
+                } else {
+                    val fromUrl = url.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                    if (fromUrl.isNotBlank() && fromUrl.contains(".")) {
+                        java.net.URLDecoder.decode(fromUrl, "UTF-8")
+                    } else {
+                        guessed
+                    }
+                }
+            } catch (_: Exception) {
+                "download_${System.currentTimeMillis()}"
+            }
+
+            sniffMediaUrl(url, detectedMedia)
+            mainHandler.post {
+                onRequestDownloadConfig(url, guessedName, 16)
+            }
+        }
 
         // Bridge for media sniffer
         addJavascriptInterface(object {
@@ -1753,6 +1954,7 @@ private fun createTabWebView(
                 url?.let {
                     tab.url = it
                     onUrlChanged(it)
+                    BrowserSessionManager.saveSession(context)
                 }
                 tab.canGoBack = canGoBack()
                 tab.canGoForward = canGoForward()
@@ -1776,6 +1978,8 @@ private fun createTabWebView(
                 tab.title = view?.title ?: "Page"
                 tab.canGoBack = canGoBack()
                 tab.canGoForward = canGoForward()
+                url?.let { if (it.isNotBlank()) tab.url = it }
+                BrowserSessionManager.saveSession(context)
 
                 // Re-inject uBlock defusers and cosmetic CSS ad filter
                 if (AdBlockEngine.isEnabled) {
@@ -1836,38 +2040,75 @@ private fun createTabWebView(
                     return true // Handled: DROP popup/redirect completely!
                 }
 
-                // 3. Media & Download handling:
-                if (isDirectDownloadUrl(reqUrl)) {
-                    sniffMediaUrl(reqUrl, detectedMedia)
+                // 3. Direct File Downloads (Archives, APKs, Documents, Torrents, Installers, etc.)
+                if (isDownloadableFile(reqUrl)) {
                     val clean = reqUrl.substringBefore("?").substringBefore("#").lowercase()
-                    val isFileArchive = clean.endsWith(".zip") || clean.endsWith(".rar") ||
-                            clean.endsWith(".7z") || clean.endsWith(".apk") || clean.endsWith(".torrent") ||
-                            reqUrl.startsWith("magnet:", ignoreCase = true)
-                    if (isFileArchive) {
-                        if (reqUrl.startsWith("magnet:", ignoreCase = true)) {
-                            val dn = Uri.parse(reqUrl).getQueryParameter("dn") ?: "Torrent_${System.currentTimeMillis()}"
-                            onStartDownload(reqUrl, dn, 8)
-                            mainHandler.post {
-                                Toast.makeText(context, "Added Magnet Torrent to SpeedDown", Toast.LENGTH_SHORT).show()
-                            }
-                        } else if (clean.endsWith(".torrent")) {
-                            val tName = reqUrl.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                            onStartDownload(reqUrl, tName, 8)
-                            mainHandler.post {
-                                Toast.makeText(context, "Added Torrent to SpeedDown", Toast.LENGTH_SHORT).show()
+                    val isMagnet = reqUrl.startsWith("magnet:", ignoreCase = true)
+                    val guessedFileName = try {
+                        if (isMagnet) {
+                            Uri.parse(reqUrl).getQueryParameter("dn") ?: "Torrent_${System.currentTimeMillis()}"
+                        } else {
+                            val lastSegment = reqUrl.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                            if (lastSegment.isNotBlank() && lastSegment.contains(".")) {
+                                java.net.URLDecoder.decode(lastSegment, "UTF-8")
+                            } else {
+                                "download_${System.currentTimeMillis()}"
                             }
                         }
-                        return true
+                    } catch (_: Exception) {
+                        "download_${System.currentTimeMillis()}"
                     }
-                    // For video/audio streams (.mp4, .m3u8, .webm), allow WebView to play natively!
-                    return false
+
+                    sniffMediaUrl(reqUrl, detectedMedia)
+                    mainHandler.post {
+                        onRequestDownloadConfig(reqUrl, guessedFileName, 16)
+                    }
+                    return true
                 }
 
-                // 4. Block rogue non-http/https schemes (intent://, market://, tel://, etc.)
+                // 4. Handle Magnet scheme
+                if (reqUrl.startsWith("magnet:", ignoreCase = true)) {
+                    val dn = Uri.parse(reqUrl).getQueryParameter("dn") ?: "Torrent_${System.currentTimeMillis()}"
+                    sniffMediaUrl(reqUrl, detectedMedia)
+                    mainHandler.post {
+                        onRequestDownloadConfig(reqUrl, dn, 16)
+                    }
+                    return true
+                }
+
+                // 5. Block rogue non-http/https schemes (intent://, market://, tel://, etc.)
                 if (!reqUrl.startsWith("http://", ignoreCase = true) && !reqUrl.startsWith("https://", ignoreCase = true)) {
                     AdBlockEngine.recordBlock()
                     mainHandler.post { onAdBlocked() }
                     return true
+                }
+
+                // 6. External / New Site Link -> OPEN IN NEW TAB!
+                val currentUrl = tab.url
+                val isCurrentWeb = currentUrl.startsWith("http://", ignoreCase = true) || currentUrl.startsWith("https://", ignoreCase = true)
+                if (isCurrentWeb) {
+                    val currentHost = try { Uri.parse(currentUrl).host?.lowercase()?.removePrefix("www.") ?: "" } catch (_: Exception) { "" }
+                    var targetHost = try { Uri.parse(reqUrl).host?.lowercase()?.removePrefix("www.") ?: "" } catch (_: Exception) { "" }
+                    var effectiveTargetUrl = reqUrl
+
+                    // Resolve search engine redirect wrappers (e.g. google.com/url?q=https://...)
+                    if (targetHost.contains("google.") && reqUrl.contains("/url?")) {
+                        val q = Uri.parse(reqUrl).getQueryParameter("q") ?: Uri.parse(reqUrl).getQueryParameter("url")
+                        if (!q.isNullOrBlank() && (q.startsWith("http://") || q.startsWith("https://"))) {
+                            effectiveTargetUrl = q
+                            targetHost = try { Uri.parse(effectiveTargetUrl).host?.lowercase()?.removePrefix("www.") ?: "" } catch (_: Exception) { "" }
+                        }
+                    }
+
+                    val isDifferentHost = currentHost.isNotBlank() && targetHost.isNotBlank() && currentHost != targetHost
+
+                    if (isDifferentHost) {
+                        // Open the external / new site in a NEW TAB so current site tab stays intact!
+                        mainHandler.post {
+                            onOpenNewTab(effectiveTargetUrl)
+                        }
+                        return true
+                    }
                 }
 
                 return super.shouldOverrideUrlLoading(view, request)
@@ -1898,11 +2139,63 @@ private fun createTabWebView(
                 isUserGesture: Boolean,
                 resultMsg: Message?
             ): Boolean {
-                // Completely block all window.open popup window requests
-                if (AdBlockEngine.isEnabled) {
-                    AdBlockEngine.recordBlock()
-                    mainHandler.post { onAdBlocked() }
+                // 1. Direct hit-test URL check
+                val hitTest = view?.hitTestResult
+                val extraUrl = hitTest?.extra
+
+                if (!extraUrl.isNullOrBlank()) {
+                    if (AdBlockEngine.isAd(extraUrl) || AdBlockEngine.isRogueRedirect(extraUrl)) {
+                        AdBlockEngine.recordBlock()
+                        mainHandler.post { onAdBlocked() }
+                        return false
+                    }
+                    mainHandler.post {
+                        onOpenNewTab(extraUrl)
+                    }
                     return false
+                }
+
+                // 2. Transport message capture for target="_blank" or window.open
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                if (transport != null) {
+                    val tempWv = WebView(context).apply {
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
+                                val destUrl = request?.url?.toString() ?: return false
+                                if (AdBlockEngine.isAd(destUrl) || AdBlockEngine.isRogueRedirect(destUrl)) {
+                                    AdBlockEngine.recordBlock()
+                                    mainHandler.post { onAdBlocked() }
+                                    v?.stopLoading()
+                                    v?.destroy()
+                                    return true
+                                }
+                                mainHandler.post {
+                                    onOpenNewTab(destUrl)
+                                }
+                                v?.stopLoading()
+                                v?.destroy()
+                                return true
+                            }
+
+                            override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(v, url, favicon)
+                                url?.let { dest ->
+                                    if (dest != "about:blank") {
+                                        if (!AdBlockEngine.isAd(dest) && !AdBlockEngine.isRogueRedirect(dest)) {
+                                            mainHandler.post {
+                                                onOpenNewTab(dest)
+                                            }
+                                        }
+                                        v?.stopLoading()
+                                        v?.destroy()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    transport.webView = tempWv
+                    resultMsg.sendToTarget()
+                    return true
                 }
                 return false
             }
@@ -1934,12 +2227,24 @@ private fun createTabWebView(
     }
 }
 
+private fun isDownloadableFile(url: String): Boolean {
+    if (url.startsWith("magnet:?xt=", ignoreCase = true)) return true
+    val clean = url.substringBefore("?").substringBefore("#").lowercase()
+    return clean.endsWith(".zip") || clean.endsWith(".rar") || clean.endsWith(".7z") ||
+            clean.endsWith(".tar") || clean.endsWith(".gz") || clean.endsWith(".bz2") || clean.endsWith(".xz") ||
+            clean.endsWith(".apk") || clean.endsWith(".xapk") || clean.endsWith(".apks") ||
+            clean.endsWith(".iso") || clean.endsWith(".img") || clean.endsWith(".dmg") ||
+            clean.endsWith(".exe") || clean.endsWith(".msi") || clean.endsWith(".deb") || clean.endsWith(".rpm") ||
+            clean.endsWith(".torrent") || clean.endsWith(".pdf") || clean.endsWith(".epub") ||
+            clean.endsWith(".bin") || clean.endsWith(".doc") || clean.endsWith(".docx") ||
+            clean.endsWith(".xls") || clean.endsWith(".xlsx") || clean.endsWith(".ppt") || clean.endsWith(".pptx")
+}
+
 private fun isDirectDownloadUrl(url: String): Boolean {
     val clean = url.substringBefore("?").substringBefore("#").lowercase()
     return clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") ||
             clean.endsWith(".m3u8") || clean.endsWith(".mpd") || clean.endsWith(".mp3") ||
-            clean.endsWith(".zip") || clean.endsWith(".rar") || clean.endsWith(".apk") ||
-            clean.endsWith(".torrent") || url.startsWith("magnet:", ignoreCase = true)
+            isDownloadableFile(url)
 }
 
 private fun sniffMediaUrl(url: String, list: MutableList<SniffedMedia>) {
@@ -1981,4 +2286,190 @@ private fun sniffMediaUrl(url: String, list: MutableList<SniffedMedia>) {
             list.add(0, SniffedMedia(url = url, fileName = fileName, type = mediaType))
         }
     }
+}
+
+@Composable
+fun BrowserDownloadConfigDialog(
+    url: String,
+    initialFileName: String,
+    defaultThreads: Int = 16,
+    onDismiss: () -> Unit,
+    onConfirm: (fileName: String, threads: Int) -> Unit
+) {
+    var fileName by remember { mutableStateOf(initialFileName) }
+    var threads by remember { mutableIntStateOf(defaultThreads.coerceIn(1, 100)) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(Purple.copy(alpha = 0.15f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Filled.Download,
+                    contentDescription = null,
+                    tint = Purple,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+        },
+        title = {
+            Text(
+                "Configure Download",
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp,
+                textAlign = TextAlign.Center
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // File Name
+                OutlinedTextField(
+                    value = fileName,
+                    onValueChange = { fileName = it },
+                    label = { Text("File Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+
+                // URL preview
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            "Source URL",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            url,
+                            fontSize = 11.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Thread Allocation Slider & Counter (1 to 100 threads)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Bolt, null, tint = Amber, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "Parallel Threads",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Surface(
+                            color = Purple.copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                if (threads >= 100) "$threads Hyper 🚀" else "$threads Connections",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Purple,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Slider(
+                        value = threads.toFloat(),
+                        onValueChange = { threads = it.toInt() },
+                        valueRange = 1f..100f,
+                        steps = 98,
+                        colors = SliderDefaults.colors(
+                            thumbColor = Purple,
+                            activeTrackColor = Purple
+                        )
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("1 (Safe)", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("32 (Fast)", fontSize = 10.sp, color = Purple)
+                        Text("64 (Ultra)", fontSize = 10.sp, color = Purple)
+                        Text("100 (Hyper 🚀)", fontSize = 10.sp, color = Purple, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(Modifier.height(2.dp))
+
+                    // Quick thread preset chips matching main app (8, 16, 32, 64, 100)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(8, 16, 32, 64, 100).forEach { count ->
+                            val isSelected = threads == count
+                            Surface(
+                                color = if (isSelected) Purple else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { threads = count }
+                            ) {
+                                Box(
+                                    modifier = Modifier.padding(vertical = 6.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        if (count == 100) "100 🚀" else "${count}T",
+                                        fontSize = 11.sp,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (isSelected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val finalName = fileName.trim().ifBlank { initialFileName }
+                    onConfirm(finalName, threads)
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Purple),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Filled.Download, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Start Download", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(18.dp)
+    )
 }

@@ -1,7 +1,7 @@
 package com.example.speeddown.ui
 
 import android.widget.Toast
-
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -67,16 +67,31 @@ enum class DownloadTab(val title: String) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DownloadManagerScreen(viewModel: DownloadViewModel) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var showBrowser by remember { mutableStateOf(false) }
+    var navigatedFromBrowser by remember { mutableStateOf(false) }
     var showSettingsScreen by remember { mutableStateOf(false) }
+
+    // When user jumped from browser to downloads screen, back gesture returns smoothly back to browser!
+    BackHandler(enabled = !showBrowser && !showSettingsScreen && navigatedFromBrowser) {
+        navigatedFromBrowser = false
+        showBrowser = true
+    }
 
     if (showBrowser) {
         BrowserScreen(
             initialUrl = "speeddown://home",
-            onClose = { showBrowser = false },
+            onClose = {
+                showBrowser = false
+                navigatedFromBrowser = false
+            },
+            onNavigateToDownloads = {
+                showBrowser = false
+                navigatedFromBrowser = true
+            },
             onStartDownload = { url, name, threads ->
                 viewModel.addDownload(url, name, threads)
-                showBrowser = false
+                android.widget.Toast.makeText(context, "Added to SpeedDown: $name", android.widget.Toast.LENGTH_SHORT).show()
             }
         )
         return
@@ -117,7 +132,6 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     var showBatchDeleteDialog by remember { mutableStateOf(false) }
     var showTopMenu by remember { mutableStateOf(false) }
 
-    val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     var clipboardUrl by remember { mutableStateOf<String?>(null) }
 

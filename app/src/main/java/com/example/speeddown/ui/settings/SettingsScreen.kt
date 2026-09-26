@@ -366,42 +366,70 @@ fun SettingsScreen(
                     Spacer(Modifier.height(14.dp))
 
                     // Default Connection Threads
-                    Text(
-                        "Default Threads per Download",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp
-                    )
-                    Text(
-                        "Simultaneous HTTP chunk streams for accelerated download speeds",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(8.dp))
-
-                    val threadOptions = listOf(1, 2, 4, 8, 16, 32)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        threadOptions.forEach { threads ->
-                            val isSel = settings.defaultThreads == threads
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (isSel) Purple else MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(32.dp)
-                                    .clickable { viewModel.updateSettings(settings.copy(defaultThreads = threads)) }
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text(
-                                        "${threads}T",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isSel) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                "Default Threads per Download",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                "Simultaneous HTTP chunk streams for accelerated download speeds",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = Purple.copy(alpha = 0.15f)
+                        ) {
+                            Text(
+                                if (settings.defaultThreads >= 100) "${settings.defaultThreads}T (Hyper 🚀)" else "${settings.defaultThreads} Connections",
+                                color = Purple,
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+
+                    val threadRows = listOf(
+                        listOf(1, 2, 4, 8),
+                        listOf(16, 32, 64, 100)
+                    )
+                    threadRows.forEachIndexed { idx, rowList ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            rowList.forEach { threads ->
+                                val isSel = settings.defaultThreads == threads
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isSel) Purple else MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(34.dp)
+                                        .clickable { viewModel.updateSettings(settings.copy(defaultThreads = threads)) }
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            if (threads == 100) "100 🚀" else "${threads}T",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isSel) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                 }
                             }
+                        }
+                        if (idx < threadRows.lastIndex) {
+                            Spacer(Modifier.height(6.dp))
                         }
                     }
                 }
