@@ -74,7 +74,24 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun openInNothingPlayer(item: DownloadItem): Boolean = repo.openInNothingPlayer(item)
 
+    fun streamInNothingPlayer(item: DownloadItem): Boolean = repo.streamInNothingPlayer(item)
+
     fun launchNothingPlayer(): Boolean = repo.launchNothingPlayerApp()
+
+    fun checkDuplicate(fileName: String): java.io.File? = repo.checkDuplicateFile(fileName)
+
+    fun refreshUrl(downloadId: Long, newUrl: String) {
+        viewModelScope.launch { repo.refreshDownloadUrl(downloadId, newUrl) }
+    }
+
+    suspend fun getStorageBreakdown(): DownloadRepository.StorageBreakdown = repo.calculateStorageBreakdown()
+
+    fun cleanupOrphanedParts(onComplete: (Int) -> Unit) {
+        viewModelScope.launch {
+            val count = repo.cleanupOrphanedParts()
+            onComplete(count)
+        }
+    }
 
     fun delete(item: DownloadItem, deleteFile: Boolean = true) {
         viewModelScope.launch { repo.deleteDownload(item, deleteFile) }

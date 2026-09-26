@@ -74,6 +74,12 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: android.content.Intent?) {
         if (intent == null) return
+
+        if (intent.getBooleanExtra("EXTRA_ACTION_NEW_DOWNLOAD", false)) {
+            viewModel.setIncomingShareUrl("")
+            return
+        }
+
         val rawUrl = when (intent.action) {
             android.content.Intent.ACTION_SEND -> {
                 intent.getStringExtra(android.content.Intent.EXTRA_TEXT)
@@ -84,8 +90,14 @@ class MainActivity : ComponentActivity() {
             else -> null
         } ?: return
 
+        val clean = rawUrl.trim()
+        if (clean.startsWith("magnet:?xt=urn:btih:", ignoreCase = true)) {
+            viewModel.setIncomingShareUrl(clean)
+            return
+        }
+
         val matcher = Regex("https?://[\\w\\d:#@%/;\$()~_?\\+-=\\\\\\.&]+", RegexOption.IGNORE_CASE)
-        val extracted = matcher.find(rawUrl)?.value ?: rawUrl.trim()
+        val extracted = matcher.find(clean)?.value ?: clean
         if (extracted.startsWith("http://") || extracted.startsWith("https://")) {
             viewModel.setIncomingShareUrl(extracted)
         }

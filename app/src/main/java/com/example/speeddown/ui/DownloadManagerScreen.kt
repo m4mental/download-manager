@@ -1,5 +1,7 @@
 package com.example.speeddown.ui
 
+import android.widget.Toast
+
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -38,6 +40,9 @@ import com.example.speeddown.data.DownloadSettings
 import com.example.speeddown.data.DownloadStatus
 import com.example.speeddown.ui.browser.BrowserScreen
 import com.example.speeddown.ui.settings.SettingsScreen
+import com.example.speeddown.ui.storage.StorageOrganizerDialog
+import com.example.speeddown.ui.dialogs.RefreshUrlDialog
+import com.example.speeddown.ui.dialogs.DuplicateWarningDialog
 import kotlinx.coroutines.launch
 import kotlin.math.ln
 import kotlin.math.pow
@@ -67,7 +72,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
 
     if (showBrowser) {
         BrowserScreen(
-            initialUrl = "https://www.google.com",
+            initialUrl = "speeddown://home",
             onClose = { showBrowser = false },
             onStartDownload = { url, name, threads ->
                 viewModel.addDownload(url, name, threads)
@@ -101,7 +106,18 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     var errorDetailItem by remember { mutableStateOf<DownloadItem?>(null) }
     var deleteTargetItem by remember { mutableStateOf<DownloadItem?>(null) }
     var checksumTargetItem by remember { mutableStateOf<DownloadItem?>(null) }
+    var refreshTargetItem by remember { mutableStateOf<DownloadItem?>(null) }
+    var showStorageDialog by remember { mutableStateOf(false) }
+    var duplicateWarningFile by remember { mutableStateOf<java.io.File?>(null) }
+    var pendingDownloadData by remember { mutableStateOf<Triple<String, String, Int>?>(null) }
 
+    // Multi-Select and Batch Actions State
+    var selectedIds by remember { mutableStateOf(setOf<Long>()) }
+    var showBatchImportDialog by remember { mutableStateOf(false) }
+    var showBatchDeleteDialog by remember { mutableStateOf(false) }
+    var showTopMenu by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     var clipboardUrl by remember { mutableStateOf<String?>(null) }
 
@@ -114,10 +130,10 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
         }
     }
 
-    // Sniff clipboard for fresh downloadable links
+    // Sniff clipboard for fresh downloadable links (HTTP, HTTPS, and MAGNET)
     LaunchedEffect(Unit) {
         val clip = clipboardManager.getText()?.text?.trim() ?: ""
-        if ((clip.startsWith("http://") || clip.startsWith("https://")) &&
+        if ((clip.startsWith("http://") || clip.startsWith("https://") || clip.startsWith("magnet:?xt=urn:btih:")) &&
             downloads.none { it.url == clip }
         ) {
             clipboardUrl = clip
@@ -126,40 +142,151 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(CircleShape)
-                                .background(Brush.linearGradient(listOf(Purple, Blue))),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Filled.Download, null, tint = Color.White, modifier = Modifier.size(18.dp))
+            if (selectedIds.isNotEmpty()) {
+                TopAppBar(
+                    title = {
+                        Text(
+                            "${selectedIds.size} Selected",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp
+                        )
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = { selectedIds = emptySet() }) {
+                            Icon(Icons.Filled.Close, "Clear Selection")
                         }
-                        Spacer(Modifier.width(10.dp))
-                        Text("SpeedDown", fontWeight = FontWeight.ExtraBold, fontSize = 22.sp)
-                    }
-                },
-                actions = {
-                    val active = downloads.count { it.status == DownloadStatus.DOWNLOADING }
-                    if (active > 0) {
-                        Badge(containerColor = Purple) { Text("$active") }
-                        Spacer(Modifier.width(6.dp))
-                    }
-                    IconButton(onClick = { showBrowser = true }) {
-                        Icon(Icons.Filled.Language, "Built-in Browser", tint = Purple)
-                    }
-                    IconButton(onClick = { viewModel.clearCompleted() }) {
-                        Icon(Icons.Filled.CleaningServices, "Clear completed")
-                    }
-                    IconButton(onClick = { showSettingsScreen = true }) {
-                        Icon(Icons.Filled.Settings, "Settings")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
-            )
+                    },
+                    actions = {
+                        // Select All / Deselect All
+                        IconButton(onClick = {
+                            selectedIds = if (selectedIds.size == downloads.size) emptySet() else downloads.map { it.id }.toSet()
+                        }) {
+                            Icon(Icons.Filled.SelectAll, "Select All")
+                        }
+                        // Pause Selected
+                        IconButton(onClick = {
+                            selectedIds.forEach { id ->
+                                val itm = downloads.find { it.id == id }
+                                if (itm != null && (itm.status == DownloadStatus.DOWNLOADING || itm.status == DownloadStatus.QUEUED)) {
+                                    viewModel.pause(itm)
+                                }
+                            }
+                        }) {
+                            Icon(Icons.Filled.Pause, "Pause Selected")
+                        }
+                        // Resume Selected
+                        IconButton(onClick = {
+                            selectedIds.forEach { id ->
+                                val itm = downloads.find { it.id == id }
+                                if (itm != null && (itm.status == DownloadStatus.PAUSED || itm.status == DownloadStatus.FAILED)) {
+                                    viewModel.resume(itm)
+                                }
+                            }
+                        }) {
+                            Icon(Icons.Filled.PlayArrow, "Resume Selected")
+                        }
+                        // Share Selected URLs
+                        IconButton(onClick = {
+                            val urls = downloads.filter { it.id in selectedIds }.joinToString("\n") { it.url }
+                            clipboardManager.setText(AnnotatedString(urls))
+                            Toast.makeText(context, "Copied ${selectedIds.size} links to clipboard", Toast.LENGTH_SHORT).show()
+                        }) {
+                            Icon(Icons.Filled.Share, "Share Selected")
+                        }
+                        // Delete Selected
+                        IconButton(onClick = { showBatchDeleteDialog = true }) {
+                            Icon(Icons.Filled.Delete, "Delete Selected", tint = Red)
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Purple.copy(alpha = 0.12f)
+                    )
+                )
+            } else {
+                TopAppBar(
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .clip(CircleShape)
+                                    .background(Brush.linearGradient(listOf(Purple, Blue))),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Filled.Download, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "SpeedDown",
+                                fontWeight = FontWeight.ExtraBold,
+                                fontSize = 18.sp,
+                                maxLines = 1
+                            )
+                        }
+                    },
+                    actions = {
+                        val active = downloads.count { it.status == DownloadStatus.DOWNLOADING }
+                        if (active > 0) {
+                            Badge(containerColor = Purple) { Text("$active") }
+                            Spacer(Modifier.width(6.dp))
+                        }
+                        IconButton(onClick = { showBrowser = true }) {
+                            Icon(Icons.Filled.Language, "Built-in Browser", tint = Purple)
+                        }
+                        IconButton(onClick = { showStorageDialog = true }) {
+                            Icon(Icons.Filled.PieChart, "Storage Organizer", tint = Blue)
+                        }
+                        IconButton(onClick = { viewModel.clearCompleted() }) {
+                            Icon(Icons.Filled.CleaningServices, "Clear completed")
+                        }
+                        IconButton(onClick = { showSettingsScreen = true }) {
+                            Icon(Icons.Filled.Settings, "Settings")
+                        }
+
+                        // More Options (Batch Import / Export / Select All)
+                        Box {
+                            IconButton(onClick = { showTopMenu = true }) {
+                                Icon(Icons.Filled.MoreVert, "More Options")
+                            }
+                            DropdownMenu(
+                                expanded = showTopMenu,
+                                onDismissRequest = { showTopMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Batch Import Links") },
+                                    leadingIcon = { Icon(Icons.Filled.PlaylistAdd, null, tint = Purple) },
+                                    onClick = {
+                                        showTopMenu = false
+                                        showBatchImportDialog = true
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Export All Links") },
+                                    leadingIcon = { Icon(Icons.Filled.FileDownload, null, tint = Blue) },
+                                    onClick = {
+                                        showTopMenu = false
+                                        val links = downloads.joinToString("\n") { it.url }
+                                        clipboardManager.setText(AnnotatedString(links))
+                                        Toast.makeText(context, "Copied ${downloads.size} links to clipboard", Toast.LENGTH_SHORT).show()
+                                    }
+                                )
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text("Select Multiple") },
+                                    leadingIcon = { Icon(Icons.Filled.Checklist, null) },
+                                    onClick = {
+                                        showTopMenu = false
+                                        if (downloads.isNotEmpty()) {
+                                            selectedIds = setOf(downloads.first().id)
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
+                )
+            }
         },
         floatingActionButton = {
             ExtendedFloatingActionButton(
@@ -311,8 +438,19 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         items(tabDownloads, key = { it.id }) { item ->
+                            val isSelected = item.id in selectedIds
+                            val isSelectionMode = selectedIds.isNotEmpty()
+
                             DownloadCard(
                                 item = item,
+                                isSelected = isSelected,
+                                isSelectionMode = isSelectionMode,
+                                onToggleSelect = {
+                                    selectedIds = if (isSelected) selectedIds - item.id else selectedIds + item.id
+                                },
+                                onLongClick = {
+                                    selectedIds = if (isSelected) selectedIds - item.id else selectedIds + item.id
+                                },
                                 onPause = { viewModel.pause(item) },
                                 onResume = { viewModel.resume(item) },
                                 onCancel = { viewModel.cancel(item) },
@@ -321,7 +459,9 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                                 onShowError = { errorDetailItem = item },
                                 onShowChecksum = { checksumTargetItem = item },
                                 isNothingPlayerInstalled = viewModel.isNothingPlayerInstalled(),
-                                onOpenWithNothingPlayer = { viewModel.openInNothingPlayer(item) }
+                                onOpenWithNothingPlayer = { viewModel.openInNothingPlayer(item) },
+                                onStreamWithNothingPlayer = { viewModel.streamInNothingPlayer(item) },
+                                onRefreshUrl = { refreshTargetItem = item }
                             )
                         }
                         item { Spacer(Modifier.height(88.dp)) }
@@ -340,7 +480,13 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 initialUrlForDialog = null
             },
             onAdd = { url, name, threads ->
-                viewModel.addDownload(url, name, threads)
+                val dup = viewModel.checkDuplicate(name)
+                if (dup != null) {
+                    duplicateWarningFile = dup
+                    pendingDownloadData = Triple(url, name, threads)
+                } else {
+                    viewModel.addDownload(url, name, threads)
+                }
                 showAddDialog = false
                 initialUrlForDialog = null
             },
@@ -348,6 +494,56 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 viewModel.addBatchDownloads(urls, threads)
                 showAddDialog = false
                 initialUrlForDialog = null
+            }
+        )
+    }
+    if (showStorageDialog) {
+        StorageOrganizerDialog(
+            viewModel = viewModel,
+            onDismiss = { showStorageDialog = false }
+        )
+    }
+    refreshTargetItem?.let { item ->
+        RefreshUrlDialog(
+            item = item,
+            onDismiss = { refreshTargetItem = null },
+            onConfirm = { newUrl ->
+                viewModel.refreshUrl(item.id, newUrl)
+                refreshTargetItem = null
+            }
+        )
+    }
+    duplicateWarningFile?.let { dupFile ->
+        DuplicateWarningDialog(
+            existingFile = dupFile,
+            onDismiss = {
+                duplicateWarningFile = null
+                pendingDownloadData = null
+            },
+            onOpenExisting = {
+                val dummyItem = DownloadItem(
+                    url = pendingDownloadData?.first ?: "",
+                    fileName = dupFile.name,
+                    filePath = dupFile.absolutePath,
+                    category = "Videos"
+                )
+                viewModel.open(dummyItem)
+                duplicateWarningFile = null
+                pendingDownloadData = null
+            },
+            onOverwrite = {
+                pendingDownloadData?.let { (u, n, t) ->
+                    viewModel.addDownload(u, n, t)
+                }
+                duplicateWarningFile = null
+                pendingDownloadData = null
+            },
+            onRenameAndDownload = { newName ->
+                pendingDownloadData?.let { (u, _, t) ->
+                    viewModel.addDownload(u, newName, t)
+                }
+                duplicateWarningFile = null
+                pendingDownloadData = null
             }
         )
     }
@@ -359,6 +555,111 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
             item = item,
             onCalculateChecksums = { viewModel.calculateChecksums(it) },
             onDismiss = { checksumTargetItem = null }
+        )
+    }
+
+    // Batch Import Links Dialog
+    if (showBatchImportDialog) {
+        var batchText by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showBatchImportDialog = false },
+            icon = { Icon(Icons.Filled.PlaylistAdd, null, tint = Purple, modifier = Modifier.size(32.dp)) },
+            title = { Text("Batch Import Links", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Paste multiple URLs (one per line) or magnet links to queue all downloads:",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = batchText,
+                        onValueChange = { batchText = it },
+                        placeholder = { Text("https://example.com/file1.zip\nhttps://example.com/movie.mp4\nmagnet:?xt=...") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = {
+                            val clip = clipboardManager.getText()?.text ?: ""
+                            if (clip.isNotBlank()) batchText = if (batchText.isBlank()) clip else "$batchText\n$clip"
+                        }) {
+                            Icon(Icons.Filled.ContentPaste, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Paste Clipboard", fontSize = 12.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val lines = batchText.lines()
+                            .map { it.trim() }
+                            .filter { it.isNotBlank() && (it.startsWith("http://") || it.startsWith("https://") || it.startsWith("magnet:")) }
+                        if (lines.isNotEmpty()) {
+                            viewModel.addBatchDownloads(lines, 8)
+                            Toast.makeText(context, "Added ${lines.size} downloads to queue", Toast.LENGTH_SHORT).show()
+                        }
+                        showBatchImportDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                ) {
+                    Text("Start Batch")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatchImportDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Batch Delete Confirmation Dialog
+    if (showBatchDeleteDialog) {
+        var deleteFromDisk by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { showBatchDeleteDialog = false },
+            icon = { Icon(Icons.Filled.Delete, null, tint = Red, modifier = Modifier.size(32.dp)) },
+            title = { Text("Delete ${selectedIds.size} Downloads?", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Are you sure you want to remove the selected downloads from SpeedDown?")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = deleteFromDisk, onCheckedChange = { deleteFromDisk = it })
+                        Spacer(Modifier.width(8.dp))
+                        Text("Also delete downloaded files from storage", fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        selectedIds.forEach { id ->
+                            val itm = downloads.find { it.id == id }
+                            if (itm != null) {
+                                viewModel.delete(itm, deleteFromDisk)
+                            }
+                        }
+                        selectedIds = emptySet()
+                        showBatchDeleteDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Red)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatchDeleteDialog = false }) {
+                    Text("Cancel")
+                }
+            }
         )
     }
     deleteTargetItem?.let { item ->
@@ -477,9 +778,14 @@ fun MultiThreadSegmentVisualizer(
 }
 
 // ─── Download Card ────────────────────────────────────────────────────────────
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DownloadCard(
     item: DownloadItem,
+    isSelected: Boolean = false,
+    isSelectionMode: Boolean = false,
+    onToggleSelect: () -> Unit = {},
+    onLongClick: () -> Unit = {},
     onPause: () -> Unit,
     onResume: () -> Unit,
     onCancel: () -> Unit,
@@ -488,22 +794,40 @@ fun DownloadCard(
     onShowError: () -> Unit,
     onShowChecksum: () -> Unit,
     isNothingPlayerInstalled: Boolean = false,
-    onOpenWithNothingPlayer: (() -> Unit)? = null
+    onOpenWithNothingPlayer: (() -> Unit)? = null,
+    onStreamWithNothingPlayer: (() -> Unit)? = null,
+    onRefreshUrl: (() -> Unit)? = null
 ) {
     val statusColor = statusColor(item.status)
     val isActive = item.status == DownloadStatus.DOWNLOADING
     val isPaused = item.status == DownloadStatus.PAUSED
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(
+                onClick = {
+                    if (isSelectionMode) onToggleSelect()
+                },
+                onLongClick = onLongClick
+            ),
         shape = RoundedCornerShape(16.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        border = if (isSelected) BorderStroke(2.dp, Purple) else null,
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 6.dp else 2.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
 
             // ── Header ──────────────────────────────────────────────────────
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                if (isSelectionMode) {
+                    Checkbox(
+                        checked = isSelected,
+                        onCheckedChange = { onToggleSelect() },
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                }
                 Box(
                     modifier = Modifier
                         .size(44.dp)
@@ -532,6 +856,20 @@ fun DownloadCard(
                             Text("📁 ${item.category}", color = MaterialTheme.colorScheme.primary, fontSize = 10.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
+                        }
+                        if (item.isTorrent) {
+                            Surface(color = Blue.copy(0.15f), shape = RoundedCornerShape(4.dp)) {
+                                Text("🧲 S:${item.torrentSeeds} P:${item.torrentPeers}", color = Blue, fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
+                            }
+                        }
+                        if (item.isHls) {
+                            Surface(color = Purple.copy(0.15f), shape = RoundedCornerShape(4.dp)) {
+                                Text("📺 HLS", color = Purple, fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
+                            }
                         }
                         if (item.threads > 1 && (isActive || isPaused)) {
                             Surface(color = Purple.copy(0.13f), shape = RoundedCornerShape(4.dp)) {
@@ -690,11 +1028,23 @@ fun DownloadCard(
                 verticalAlignment = Alignment.CenterVertically) {
                 when (item.status) {
                     DownloadStatus.DOWNLOADING -> {
+                        if (isNothingPlayerInstalled && (item.category == "Videos" || item.category == "Music" || item.isStreamable)) {
+                            ActionBtn("⚡ Stream", Icons.Filled.PlayCircle, Purple) {
+                                if (onStreamWithNothingPlayer != null) onStreamWithNothingPlayer()
+                            }
+                            Spacer(Modifier.width(8.dp))
+                        }
                         ActionBtn("Pause",  Icons.Filled.Pause,  Amber, onPause)
                         Spacer(Modifier.width(8.dp))
                         ActionBtn("Cancel", Icons.Filled.Close,  Red,   onCancel)
                     }
                     DownloadStatus.PAUSED -> {
+                        if (isNothingPlayerInstalled && (item.category == "Videos" || item.category == "Music" || item.isStreamable)) {
+                            ActionBtn("⚡ Stream", Icons.Filled.PlayCircle, Purple) {
+                                if (onStreamWithNothingPlayer != null) onStreamWithNothingPlayer()
+                            }
+                            Spacer(Modifier.width(8.dp))
+                        }
                         ActionBtn("Resume", Icons.Filled.PlayArrow, Blue, onResume)
                         Spacer(Modifier.width(8.dp))
                         ActionBtn("Cancel", Icons.Filled.Close,     Red,  onCancel)
@@ -713,9 +1063,13 @@ fun DownloadCard(
                         ActionBtn("Delete", Icons.Filled.Delete,                 Red,   onDelete)
                     }
                     DownloadStatus.FAILED -> {
-                        ActionBtn("Details", Icons.Filled.Info,    Gray,  onShowError)
+                        ActionBtn("Refresh URL", Icons.Filled.Link, Blue) {
+                            if (onRefreshUrl != null) onRefreshUrl()
+                        }
                         Spacer(Modifier.width(8.dp))
                         ActionBtn("Retry",   Icons.Filled.Refresh,  Purple, onResume)
+                        Spacer(Modifier.width(8.dp))
+                        ActionBtn("Details", Icons.Filled.Info,    Gray,  onShowError)
                         Spacer(Modifier.width(8.dp))
                         ActionBtn("Delete",  Icons.Filled.Delete,   Red,   onDelete)
                     }
@@ -956,7 +1310,12 @@ fun AddDownloadDialog(
                         onValueChange = { newUrl ->
                             url = newUrl
                             urlError = ""
-                            if (fileName.isBlank()) {
+                            if (newUrl.startsWith("magnet:?xt=urn:btih:", ignoreCase = true)) {
+                                val meta = com.example.speeddown.engine.TorrentEngine.parseMagnet(newUrl)
+                                if (meta != null && fileName.isBlank()) {
+                                    fileName = meta.displayName
+                                }
+                            } else if (fileName.isBlank()) {
                                 try {
                                     val clean = newUrl.trim()
                                     val candidate = clean.substringAfterLast("/").substringBefore("?").substringBefore("#")
@@ -967,7 +1326,7 @@ fun AddDownloadDialog(
                             }
                         },
                         label = { Text("Download URL *") },
-                        placeholder = { Text("https://example.com/file.zip") },
+                        placeholder = { Text("https://... or magnet:?xt=urn:btih:...") },
                         isError = urlError.isNotEmpty(),
                         supportingText = if (urlError.isNotEmpty()) {{ Text(urlError, color = Red) }} else null,
                         modifier = Modifier.fillMaxWidth(),

@@ -246,6 +246,29 @@ class DownloadStore private constructor(private val context: Context) {
         persistToDisk()
     }
 
+    suspend fun updateUrl(id: Long, newUrl: String) {
+        ensureLoaded()
+        _downloadsState.update { current ->
+            current.map {
+                if (it.id == id) it.copy(
+                    originalUrl = it.originalUrl ?: it.url,
+                    url = newUrl,
+                    errorMessage = null
+                ) else it
+            }
+        }
+        persistToDisk()
+    }
+
+    suspend fun updateTorrentStats(id: Long, peers: Int, seeds: Int) {
+        ensureLoaded()
+        _downloadsState.update { current ->
+            current.map {
+                if (it.id == id) it.copy(torrentPeers = peers, torrentSeeds = seeds) else it
+            }
+        }
+    }
+
     private suspend fun persistToDisk() {
         saveMutex.withLock {
             try {

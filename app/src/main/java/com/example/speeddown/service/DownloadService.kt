@@ -30,8 +30,34 @@ class DownloadService : Service() {
 
     private lateinit var store: DownloadStore
     private lateinit var downloader: MultiThreadDownloader
+    private lateinit var hlsDownloader: com.example.speeddown.engine.HlsDownloader
+    private lateinit var torrentEngine: com.example.speeddown.engine.TorrentEngine
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var isForeground = false
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                wakeLock = pm?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SpeedDown:DownloadWakeLock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(12 * 60 * 60 * 1000L) // 12 hours safe timeout
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {}
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -43,7 +69,20 @@ class DownloadService : Service() {
         }
         val connectionPool = okhttp3.ConnectionPool(120, 5, TimeUnit.MINUTES)
 
+        val browserSettings = runCatching {
+            kotlinx.coroutines.runBlocking {
+                com.example.speeddown.data.BrowserSettingsStore.getInstance(applicationContext).getSnapshot()
+            }
+        }.getOrNull()
+
+        val dns = if (browserSettings != null) {
+            com.example.speeddown.engine.SecureDnsHelper.createOkHttpDns(browserSettings.dnsProvider, browserSettings.customDnsIp)
+        } else {
+            okhttp3.Dns.SYSTEM
+        }
+
         val client = OkHttpClient.Builder()
+            .dns(dns)
             .dispatcher(dispatcher)
             .connectionPool(connectionPool)
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -54,7 +93,29 @@ class DownloadService : Service() {
             .build()
 
         downloader = MultiThreadDownloader(client, store)
+        hlsDownloader = com.example.speeddown.engine.HlsDownloader(client, store)
+        torrentEngine = com.example.speeddown.engine.TorrentEngine(client, store)
         createNotificationChannel()
+        registerNetworkCallback()
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager ?: return
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    super.onAvailable(network)
+                    serviceScope.launch {
+                        // Network is back: auto-resume any queued or interrupted downloads
+                        checkAndStartNextQueued()
+                    }
+                }
+            }
+            networkCallback?.let { cm.registerNetworkCallback(request, it) }
+        } catch (_: Exception) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -72,6 +133,8 @@ class DownloadService : Service() {
             ACTION_PAUSE -> {
                 if (id != -1L) {
                     downloader.pauseDownload(id)
+                    hlsDownloader.pauseHls(id)
+                    torrentEngine.pauseTorrent(id)
                     serviceScope.launch {
                         store.updateStatus(id, DownloadStatus.PAUSED)
                         updateActiveNotification()
@@ -85,6 +148,8 @@ class DownloadService : Service() {
             ACTION_CANCEL -> {
                 if (id != -1L) {
                     downloader.cancelDownload(id)
+                    hlsDownloader.cancelHls(id)
+                    torrentEngine.cancelTorrent(id)
                     serviceScope.launch {
                         store.updateStatus(id, DownloadStatus.CANCELLED)
                         updateActiveNotification()
@@ -144,47 +209,76 @@ class DownloadService : Service() {
             store.updateStatus(downloadId, DownloadStatus.DOWNLOADING)
             startForegroundCompat(downloadId, item.fileName)
 
-            downloader.startDownload(
-                scope = serviceScope,
-                item = item,
-                speedLimitKbps = settings.speedLimitKbps,
-                onProgress = { downloaded, speed, parts ->
-                    serviceScope.launch {
-                        val currentItem = store.getById(downloadId)
-                        // If item was cancelled, deleted from store (null), or not downloading:
-                        if (currentItem == null || currentItem.status != DownloadStatus.DOWNLOADING) {
-                            downloader.cancelDownload(downloadId)
-                            updateActiveNotification()
-                            return@launch
-                        }
-                        store.updateProgress(downloadId, downloaded, speed, DownloadStatus.DOWNLOADING, parts)
-                        val total = currentItem.totalSize
-                        val name = currentItem.fileName
-                        updateNotification(downloadId, name, total, downloaded, speed)
-                    }
-                },
-                onComplete = {
-                    serviceScope.launch {
-                        val currentItem = store.getById(downloadId)
-                        if (currentItem != null && currentItem.status == DownloadStatus.DOWNLOADING) {
-                            store.markCompleted(downloadId)
-                            showDownloadCompleteNotification(currentItem.fileName)
-                        }
+            val progressCallback: (Long, Long, List<Float>) -> Unit = { downloaded, speed, parts ->
+                serviceScope.launch {
+                    val currentItem = store.getById(downloadId)
+                    if (currentItem == null || currentItem.status != DownloadStatus.DOWNLOADING) {
+                        downloader.cancelDownload(downloadId)
+                        hlsDownloader.cancelHls(downloadId)
+                        torrentEngine.cancelTorrent(downloadId)
                         updateActiveNotification()
-                        checkAndStartNextQueued()
+                        return@launch
                     }
-                },
-                onError = { error ->
-                    serviceScope.launch {
-                        val currentItem = store.getById(downloadId)
-                        if (currentItem != null && currentItem.status == DownloadStatus.DOWNLOADING) {
-                            store.updateError(downloadId, DownloadStatus.FAILED, error)
-                        }
-                        updateActiveNotification()
-                        checkAndStartNextQueued()
-                    }
+                    store.updateProgress(downloadId, downloaded, speed, DownloadStatus.DOWNLOADING, parts)
+                    val total = currentItem.totalSize
+                    val name = currentItem.fileName
+                    updateNotification(downloadId, name, total, downloaded, speed)
                 }
-            )
+            }
+
+            val completeCallback: () -> Unit = {
+                serviceScope.launch {
+                    val currentItem = store.getById(downloadId)
+                    if (currentItem != null && currentItem.status == DownloadStatus.DOWNLOADING) {
+                        store.markCompleted(downloadId)
+                        showDownloadCompleteNotification(currentItem.fileName)
+                    }
+                    updateActiveNotification()
+                    checkAndStartNextQueued()
+                }
+            }
+
+            val errorCallback: (String) -> Unit = { error ->
+                serviceScope.launch {
+                    val currentItem = store.getById(downloadId)
+                    if (currentItem != null && currentItem.status == DownloadStatus.DOWNLOADING) {
+                        store.updateError(downloadId, DownloadStatus.FAILED, error)
+                    }
+                    updateActiveNotification()
+                    checkAndStartNextQueued()
+                }
+            }
+
+            when {
+                item.isTorrent || com.example.speeddown.engine.TorrentEngine.isMagnet(item.url) -> {
+                    torrentEngine.startTorrentDownload(
+                        scope = serviceScope,
+                        item = item,
+                        onProgress = progressCallback,
+                        onComplete = completeCallback,
+                        onError = errorCallback
+                    )
+                }
+                item.isHls || item.url.contains(".m3u8", ignoreCase = true) -> {
+                    hlsDownloader.startHlsDownload(
+                        scope = serviceScope,
+                        item = item,
+                        onProgress = progressCallback,
+                        onComplete = completeCallback,
+                        onError = errorCallback
+                    )
+                }
+                else -> {
+                    downloader.startDownload(
+                        scope = serviceScope,
+                        item = item,
+                        speedLimitKbps = settings.speedLimitKbps,
+                        onProgress = progressCallback,
+                        onComplete = completeCallback,
+                        onError = errorCallback
+                    )
+                }
+            }
         }
     }
 
@@ -196,6 +290,7 @@ class DownloadService : Service() {
         val active = store.getActiveDownloads()
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (active.isEmpty()) {
+            releaseWakeLock()
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -208,6 +303,7 @@ class DownloadService : Service() {
             nm.cancel(NOTIFICATION_ID)
             stopSelf()
         } else {
+            acquireWakeLock()
             val firstActive = active.first()
             updateNotification(
                 downloadId = firstActive.id,
@@ -220,6 +316,7 @@ class DownloadService : Service() {
     }
 
     private fun startForegroundCompat(downloadId: Long = -1L, name: String = "Download Service Active") {
+        acquireWakeLock()
         if (!isForeground) {
             val notification = buildNotification(downloadId, "SpeedDown", name, 0, 0, ongoing = true)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -362,6 +459,11 @@ class DownloadService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseWakeLock()
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            networkCallback?.let { cm?.unregisterNetworkCallback(it) }
+        } catch (_: Exception) {}
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.cancel(NOTIFICATION_ID)
         serviceScope.cancel()

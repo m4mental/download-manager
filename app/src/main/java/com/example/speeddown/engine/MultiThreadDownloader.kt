@@ -424,61 +424,82 @@ class MultiThreadDownloader(
         val callList = activeCalls.computeIfAbsent(downloadId) {
             java.util.Collections.synchronizedList(mutableListOf())
         }
-        callList.add(call)
 
-        val response: Response
-        try {
-            response = call.execute()
-        } catch (e: IOException) {
-            callList.remove(call)
-            if (cancelFlag.get() || pauseFlag.get()) {
+        var attempts = 0
+        val maxAttempts = 4
+        while (attempts < maxAttempts && !cancelFlag.get() && !pauseFlag.get()) {
+            attempts++
+            val existingBytes = if (useRange && partFile.exists()) partFile.length() else 0L
+            partProgressBytes.set(existingBytes)
+
+            // Check if this chunk is already finished
+            if (useRange && chunkEnd > 0 && chunkStart + existingBytes > chunkEnd) {
                 return
             }
-            throw e
-        }
 
-        if (!response.isSuccessful && response.code != 206) {
-            callList.remove(call)
-            val code = response.code
-            response.close()
-            throw IOException("HTTP $code: ${getHttpErrorMessage(code)}")
-        }
+            val requestStart = if (useRange) chunkStart + existingBytes else 0L
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .header("User-Agent", BROWSER_USER_AGENT)
+                .header("Accept", "*/*")
 
-        val body = response.body ?: run {
-            callList.remove(call)
-            response.close()
-            throw IOException("Empty response body from server")
-        }
+            if (useRange && chunkStart >= 0) {
+                val rangeHeader = if (chunkEnd > 0) "bytes=$requestStart-$chunkEnd" else "bytes=$requestStart-"
+                requestBuilder.header("Range", rangeHeader)
+            }
 
-        val buffer = ByteArray(65536) // 64KB buffer for high speed
-        try {
-            // Append directly to the part file for seamless resumption
-            FileOutputStream(partFile, useRange).use { fileOut ->
-                body.byteStream().use { stream ->
-                    while (!cancelFlag.get() && !pauseFlag.get()) {
-                        val read = stream.read(buffer)
-                        if (read == -1) break
-                        fileOut.write(buffer, 0, read)
-                        partProgressBytes.addAndGet(read.toLong())
-                        totalDownloaded.addAndGet(read.toLong())
-                        if (speedLimitKbps > 0) {
-                            val perThreadBps = (speedLimitKbps * 1024L) / java.lang.Math.max(1, threadCount)
-                            val sleepMs = ((read.toDouble() / perThreadBps) * 1000.0).toLong()
-                            if (sleepMs > 0) {
-                                delay(sleepMs.coerceAtMost(250L))
+            val call = okHttpClient.newCall(requestBuilder.build())
+            callList.add(call)
+
+            try {
+                val response = call.execute()
+                if (!response.isSuccessful && response.code != 206) {
+                    val code = response.code
+                    response.close()
+                    throw IOException("HTTP $code: ${getHttpErrorMessage(code)}")
+                }
+
+                val body = response.body ?: run {
+                    response.close()
+                    throw IOException("Empty response body from server")
+                }
+
+                val buffer = ByteArray(65536) // 64KB buffer for high speed
+                FileOutputStream(partFile, useRange).use { fileOut ->
+                    body.byteStream().use { stream ->
+                        while (!cancelFlag.get() && !pauseFlag.get()) {
+                            val read = stream.read(buffer)
+                            if (read == -1) break
+                            fileOut.write(buffer, 0, read)
+                            partProgressBytes.addAndGet(read.toLong())
+                            totalDownloaded.addAndGet(read.toLong())
+                            if (speedLimitKbps > 0) {
+                                val perThreadBps = (speedLimitKbps * 1024L) / java.lang.Math.max(1, threadCount)
+                                val sleepMs = ((read.toDouble() / perThreadBps) * 1000.0).toLong()
+                                if (sleepMs > 0) {
+                                    delay(sleepMs.coerceAtMost(250L))
+                                }
                             }
                         }
+                        fileOut.flush()
                     }
-                    fileOut.flush()
                 }
-            }
-        } catch (e: IOException) {
-            if (!cancelFlag.get() && !pauseFlag.get()) {
+                response.close()
+                // Successfully completed chunk
+                return
+            } catch (e: IOException) {
+                if (cancelFlag.get() || pauseFlag.get()) {
+                    return
+                }
+                if (attempts < maxAttempts && (e is SocketTimeoutException || e is ConnectException || e is SSLException || e.message?.contains("unexpected end of stream") == true)) {
+                    Log.w(TAG, "Chunk $chunkStart connection dropped, auto-retrying ($attempts/$maxAttempts) in ${attempts * 1000}ms...")
+                    delay(attempts * 1000L)
+                    continue
+                }
                 throw e
+            } finally {
+                callList.remove(call)
             }
-        } finally {
-            callList.remove(call)
-            response.close()
         }
     }
 

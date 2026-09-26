@@ -21,7 +21,13 @@ data class DownloadItem(
     val createdAt: Long = System.currentTimeMillis(),
     val completedAt: Long? = null,
     val partProgress: List<Float> = emptyList(),
-    val category: String = "Files"
+    val category: String = "Files",
+    val isStreamable: Boolean = false,
+    val isTorrent: Boolean = false,
+    val isHls: Boolean = false,
+    val torrentPeers: Int = 0,
+    val torrentSeeds: Int = 0,
+    val originalUrl: String? = null
 ) {
     val progress: Float
         get() = if (totalSize > 0) (downloadedSize.toFloat() / totalSize.toFloat()) else 0f

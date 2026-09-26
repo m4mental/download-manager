@@ -1,17 +1,32 @@
 package com.example.speeddown.ui.browser
 
 import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.Message
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.*
+import android.widget.FrameLayout
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -25,13 +40,31 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
+import android.widget.Toast
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.speeddown.data.BrowserSettings
+import com.example.speeddown.data.BrowserSettingsStore
+import com.example.speeddown.data.getHomeUrl
+import com.example.speeddown.data.getSearchUrl
+import com.example.speeddown.engine.AdBlockEngine
+import com.example.speeddown.engine.HlsStreamVariant
+import com.example.speeddown.engine.SecureDnsHelper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 data class SniffedMedia(
     val url: String,
@@ -40,83 +73,381 @@ data class SniffedMedia(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+class BrowserTabItem(
+    val id: String = UUID.randomUUID().toString(),
+    initialUrl: String = "speeddown://home",
+    val isIncognito: Boolean = false
+) {
+    var title by mutableStateOf(if (isIncognito) "Incognito Tab" else "SpeedDown Home")
+    var url by mutableStateOf(initialUrl)
+    var webProgress by mutableStateOf(0)
+    var canGoBack by mutableStateOf(false)
+    var canGoForward by mutableStateOf(false)
+    var isDesktopMode by mutableStateOf(false)
+    var webView: WebView? = null
+}
+
+private const val MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
+private const val DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
 private val Purple = Color(0xFF7C3AED)
 private val Green = Color(0xFF16A34A)
+private val Blue = Color(0xFF2563EB)
+private val Amber = Color(0xFFF59E0B)
+private val detectedUrlsCache = ConcurrentHashMap.newKeySet<String>()
+private val mainHandler = Handler(Looper.getMainLooper())
+
+object BrowserSessionManager {
+    val tabs = mutableStateListOf<BrowserTabItem>()
+    var activeTabId by mutableStateOf("")
+    private var isInitialized = false
+
+    fun getOrCreateTabs(initialUrl: String = "speeddown://home", defaultDesktop: Boolean = false): MutableList<BrowserTabItem> {
+        if (!isInitialized || tabs.isEmpty()) {
+            val firstTab = BrowserTabItem(initialUrl = initialUrl).apply {
+                isDesktopMode = defaultDesktop
+            }
+            tabs.clear()
+            tabs.add(firstTab)
+            activeTabId = firstTab.id
+            isInitialized = true
+        }
+        return tabs
+    }
+
+    fun removeTab(tab: BrowserTabItem) {
+        val index = tabs.indexOf(tab)
+        tab.webView?.let { wv ->
+            (wv.parent as? ViewGroup)?.removeView(wv)
+            wv.stopLoading()
+            wv.destroy()
+        }
+        tab.webView = null
+        tabs.remove(tab)
+        if (tabs.isEmpty()) {
+            val newTab = BrowserTabItem(initialUrl = "speeddown://home")
+            tabs.add(newTab)
+            activeTabId = newTab.id
+        } else if (activeTabId == tab.id) {
+            val nextIndex = (index - 1).coerceAtLeast(0)
+            activeTabId = tabs[nextIndex].id
+        }
+    }
+
+    fun clearAll() {
+        tabs.forEach { tab ->
+            tab.webView?.let { wv ->
+                (wv.parent as? ViewGroup)?.removeView(wv)
+                wv.stopLoading()
+                wv.destroy()
+            }
+            tab.webView = null
+        }
+        tabs.clear()
+        isInitialized = false
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun BrowserScreen(
-    initialUrl: String = "https://www.google.com",
+    initialUrl: String = "speeddown://home",
     onClose: () -> Unit,
     onStartDownload: (url: String, fileName: String, threads: Int) -> Unit
 ) {
-    var currentUrl by remember { mutableStateOf(initialUrl) }
-    var inputUrl by remember { mutableStateOf(initialUrl) }
-    var pageTitle by remember { mutableStateOf("SpeedDown Browser") }
-    var webProgress by remember { mutableStateOf(0) }
-    var webViewInstance by remember { mutableStateOf<WebView?>(null) }
-    var canGoBack by remember { mutableStateOf(false) }
-    var canGoForward by remember { mutableStateOf(false) }
-    var showSnifferSheet by remember { mutableStateOf(false) }
-
-    val detectedMedia = remember { mutableStateListOf<SniffedMedia>() }
+    val context = LocalContext.current
     val focusManager = LocalFocusManager.current
+    val detectedMedia = remember { mutableStateListOf<SniffedMedia>() }
+
+    // Initialize uBlock Engine with asset database
+    LaunchedEffect(Unit) {
+        AdBlockEngine.init(context)
+    }
+
+    val browserSettingsStore = remember { BrowserSettingsStore.getInstance(context) }
+    val browserSettings by browserSettingsStore.settings.collectAsState(initial = BrowserSettings())
+    val shortcuts by browserSettingsStore.shortcuts.collectAsState(initial = emptyList())
+
+    // Persistent in-memory multi-tab session across screen navigation
+    val tabs = BrowserSessionManager.getOrCreateTabs(initialUrl, browserSettings.defaultDesktopMode)
+    var activeTabId by remember { mutableStateOf(BrowserSessionManager.activeTabId.ifBlank { tabs.first().id }) }
+    LaunchedEffect(activeTabId) {
+        BrowserSessionManager.activeTabId = activeTabId
+    }
+    val currentTab = tabs.find { it.id == activeTabId } ?: tabs.first()
+    val coroutineScope = rememberCoroutineScope()
+
+    var inputUrl by remember(activeTabId, currentTab.url) {
+        mutableStateOf(if (currentTab.url == "speeddown://home" || currentTab.url == "about:blank") "" else currentTab.url)
+    }
+    var showSnifferSheet by remember { mutableStateOf(false) }
+    var showTabsSheet by remember { mutableStateOf(false) }
+    var showAdBlockDialog by remember { mutableStateOf(false) }
+    var showBrowserSettings by remember { mutableStateOf(false) }
+    var showZoomDialog by remember { mutableStateOf(false) }
+    var showMoreMenu by remember { mutableStateOf(false) }
+    var adBlockEnabled by remember { mutableStateOf(AdBlockEngine.isEnabled) }
+    var blockedCountState by remember { mutableIntStateOf(AdBlockEngine.blockedAdsCount) }
+    var customFullscreenView by remember { mutableStateOf<View?>(null) }
+    var customFullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+
+    // HLS Multi-Quality Picker State
+    var hlsVariantsToPick by remember { mutableStateOf<List<HlsStreamVariant>?>(null) }
+    var hlsTargetMedia by remember { mutableStateOf<SniffedMedia?>(null) }
+    var isResolvingHls by remember { mutableStateOf(false) }
+
+    // In-App Video Preview Dialog State
+    var previewMedia by remember { mutableStateOf<SniffedMedia?>(null) }
+
+    // Predictive Back Gesture & Hierarchical In-App Navigation
+    BackHandler(enabled = true) {
+        if (showMoreMenu) {
+            showMoreMenu = false
+        } else if (showBrowserSettings) {
+            showBrowserSettings = false
+        } else if (showTabsSheet) {
+            showTabsSheet = false
+        } else if (showSnifferSheet) {
+            showSnifferSheet = false
+        } else if (showAdBlockDialog) {
+            showAdBlockDialog = false
+        } else if (showZoomDialog) {
+            showZoomDialog = false
+        } else if (previewMedia != null) {
+            previewMedia = null
+        } else if (hlsVariantsToPick != null) {
+            hlsVariantsToPick = null
+        } else if (customFullscreenView != null) {
+            customFullscreenCallback?.onCustomViewHidden()
+            customFullscreenView = null
+            customFullscreenCallback = null
+        } else if (currentTab.webView?.canGoBack() == true) {
+            currentTab.webView?.goBack()
+        } else {
+            // Reached beginning of browsing history on this tab: return smoothly to main app, keeping website open in the tab!
+            onClose()
+        }
+    }
+
+    if (showBrowserSettings) {
+        BrowserSettingsScreen(
+            currentSettings = browserSettings,
+            onSaveSettings = { updated ->
+                coroutineScope.launch {
+                    browserSettingsStore.updateSettings(updated)
+                }
+            },
+            onClearData = { clearCache, clearCookies, clearHistory, clearStorage ->
+                coroutineScope.launch(Dispatchers.Main) {
+                    if (clearCookies) {
+                        CookieManager.getInstance().removeAllCookies(null)
+                        CookieManager.getInstance().flush()
+                    }
+                    if (clearCache) {
+                        tabs.forEach { it.webView?.clearCache(true) }
+                    }
+                    if (clearHistory) {
+                        tabs.forEach { it.webView?.clearHistory() }
+                    }
+                    if (clearStorage) {
+                        WebStorage.getInstance().deleteAllData()
+                    }
+                    Toast.makeText(context, "Browsing data cleared", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onResetShortcuts = {
+                coroutineScope.launch {
+                    browserSettingsStore.resetShortcutsToDefault()
+                }
+                Toast.makeText(context, "Speed dial shortcuts reset to defaults", Toast.LENGTH_SHORT).show()
+            },
+            onBack = { showBrowserSettings = false }
+        )
+        return
+    }
+
+    // Live sync browser settings to all open webviews
+    LaunchedEffect(browserSettings) {
+        tabs.forEach { tab ->
+            tab.webView?.settings?.let { s ->
+                s.textZoom = browserSettings.textZoom
+                s.javaScriptEnabled = browserSettings.javaScriptEnabled
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    s.forceDark = if (browserSettings.forceDarkMode) WebSettings.FORCE_DARK_ON else WebSettings.FORCE_DARK_OFF
+                }
+            }
+            tab.webView?.let { wv ->
+                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, browserSettings.acceptThirdPartyCookies && !tab.isIncognito)
+            }
+        }
+    }
+
+    // Detach WebViews cleanly when leaving BrowserScreen so they can safely reattach later without being destroyed
+    DisposableEffect(Unit) {
+        onDispose {
+            tabs.forEach { tab ->
+                tab.webView?.let { wv ->
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                }
+            }
+        }
+    }
+
+    // Keep inputUrl synced when activeTab changes
+    LaunchedEffect(activeTabId) {
+        inputUrl = if (currentTab.url == "speeddown://home") "" else currentTab.url
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    OutlinedTextField(
-                        value = inputUrl,
-                        onValueChange = { inputUrl = it },
-                        singleLine = true,
-                        placeholder = { Text("Search or enter URL...", fontSize = 13.sp) },
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-                        keyboardActions = KeyboardActions(onGo = {
-                            focusManager.clearFocus()
-                            var target = inputUrl.trim()
-                            if (!target.startsWith("http://") && !target.startsWith("https://")) {
-                                target = if (target.contains(".") && !target.contains(" ")) {
-                                    "https://$target"
-                                } else {
-                                    "https://www.google.com/search?q=" + java.net.URLEncoder.encode(target, "UTF-8")
+                    val isHome = currentTab.url == "speeddown://home" || currentTab.url.isEmpty() || currentTab.url == "about:blank"
+                    if (isHome) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "SpeedDown Browser",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    } else {
+                        // Spacious, clean, modern address bar with Security Lock indicator
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .background(
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                    shape = RoundedCornerShape(22.dp)
+                                )
+                                .border(
+                                    width = 1.dp,
+                                    color = Purple.copy(alpha = 0.35f),
+                                    shape = RoundedCornerShape(22.dp)
+                                )
+                                .padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxSize(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                val isHttps = currentTab.url.startsWith("https://", ignoreCase = true)
+                                val isHttp = currentTab.url.startsWith("http://", ignoreCase = true)
+                                Icon(
+                                    imageVector = if (isHttps) Icons.Filled.Lock else if (isHttp) Icons.Filled.LockOpen else Icons.Filled.Search,
+                                    contentDescription = if (isHttps) "Secure HTTPS" else if (isHttp) "Not Secure HTTP" else "Search",
+                                    tint = if (isHttps) Green else if (isHttp) Amber else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                    modifier = Modifier.size(16.dp)
+                                )
+
+                                Spacer(Modifier.width(8.dp))
+
+                                BasicTextField(
+                                    value = inputUrl,
+                                    onValueChange = { inputUrl = it },
+                                    singleLine = true,
+                                    textStyle = TextStyle(
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Normal
+                                    ),
+                                    cursorBrush = SolidColor(Purple),
+                                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+                                    keyboardActions = KeyboardActions(onGo = {
+                                        focusManager.clearFocus()
+                                        var target = inputUrl.trim()
+                                        if (!target.startsWith("http://") && !target.startsWith("https://")) {
+                                            target = if (target.contains(".") && !target.contains(" ")) {
+                                                if (browserSettings.httpsOnly) "https://$target" else "http://$target"
+                                            } else {
+                                                browserSettings.getSearchUrl(target)
+                                            }
+                                        } else if (browserSettings.httpsOnly && target.startsWith("http://", ignoreCase = true)) {
+                                            target = "https://" + target.substring(7)
+                                        }
+                                        currentTab.url = target
+                                        inputUrl = target
+                                        currentTab.webView?.loadUrl(target)
+                                    }),
+                                    modifier = Modifier.weight(1f),
+                                    decorationBox = { innerTextField ->
+                                        if (inputUrl.isEmpty()) {
+                                            Text(
+                                                "Search or enter URL...",
+                                                fontSize = 13.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                            )
+                                        }
+                                        innerTextField()
+                                    }
+                                )
+
+                                val isBookmarked = shortcuts.any { it.url.equals(currentTab.url, ignoreCase = true) }
+                                if (currentTab.url != "speeddown://home" && currentTab.url.startsWith("http")) {
+                                    IconButton(
+                                        onClick = {
+                                            if (isBookmarked) {
+                                                val existing = shortcuts.find { it.url.equals(currentTab.url, ignoreCase = true) }
+                                                if (existing != null) {
+                                                    coroutineScope.launch {
+                                                        browserSettingsStore.removeShortcut(existing.id)
+                                                    }
+                                                    Toast.makeText(context, "Removed from Shortcuts", Toast.LENGTH_SHORT).show()
+                                                }
+                                            } else {
+                                                val title = currentTab.title.ifBlank { "Saved Site" }
+                                                coroutineScope.launch {
+                                                    browserSettingsStore.addShortcut(title, currentTab.url)
+                                                }
+                                                Toast.makeText(context, "Added to Home Shortcuts!", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isBookmarked) Icons.Filled.Star else Icons.Filled.StarBorder,
+                                            contentDescription = "Bookmark",
+                                            tint = if (isBookmarked) Amber else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+
+                                if (inputUrl.isNotBlank()) {
+                                    IconButton(
+                                        onClick = { inputUrl = "" },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Close,
+                                            contentDescription = "Clear",
+                                            modifier = Modifier.size(16.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                 }
                             }
-                            currentUrl = target
-                            inputUrl = target
-                            webViewInstance?.loadUrl(target)
-                        }),
-                        trailingIcon = {
-                            if (inputUrl.isNotBlank()) {
-                                IconButton(onClick = { inputUrl = "" }) {
-                                    Icon(Icons.Filled.Close, "Clear", modifier = Modifier.size(16.dp))
-                                }
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Purple,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(0.4f),
-                            focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(0.3f),
-                            unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(0.3f)
-                        )
-                    )
+                        }
+                    }
                 },
                 navigationIcon = {
                     IconButton(onClick = onClose) {
-                        Icon(Icons.Filled.ArrowBack, "Back to Downloads")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to Downloads")
                     }
                 },
                 actions = {
-                    IconButton(onClick = { webViewInstance?.reload() }) {
-                        Icon(Icons.Filled.Refresh, "Reload")
-                    }
+                    // Actions moved to bottom 3-dot menu so TopAppBar stays completely clean and spacious
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = if (currentTab.isIncognito) Color(0xFF1E1B2E) else MaterialTheme.colorScheme.surface
+                )
             )
         },
         bottomBar = {
@@ -128,50 +459,324 @@ fun BrowserScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                        .padding(horizontal = 4.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        IconButton(
-                            onClick = { webViewInstance?.goBack() },
-                            enabled = canGoBack
+                    // 1. Back
+                    IconButton(
+                        onClick = {
+                            if (currentTab.webView?.canGoBack() == true) {
+                                currentTab.webView?.goBack()
+                            } else if (currentTab.url != "speeddown://home") {
+                                currentTab.url = "speeddown://home"
+                                currentTab.title = "SpeedDown Home"
+                                inputUrl = ""
+                                currentTab.webView?.loadUrl("about:blank")
+                            }
+                        },
+                        enabled = currentTab.canGoBack || (currentTab.url != "speeddown://home" && currentTab.url.isNotBlank()),
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    // 2. Forward
+                    IconButton(
+                        onClick = { currentTab.webView?.goForward() },
+                        enabled = currentTab.canGoForward,
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowForward,
+                            contentDescription = "Forward",
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    // 3. Home
+                    IconButton(
+                        onClick = {
+                            currentTab.url = "speeddown://home"
+                            currentTab.title = "SpeedDown Home"
+                            inputUrl = ""
+                            currentTab.webView?.loadUrl("about:blank")
+                        },
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Home,
+                            contentDescription = "Home",
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    // 4. New Tab
+                    IconButton(
+                        onClick = {
+                            val newTab = BrowserTabItem(
+                                initialUrl = browserSettings.getHomeUrl(),
+                                isIncognito = false
+                            ).apply {
+                                isDesktopMode = browserSettings.defaultDesktopMode
+                            }
+                            tabs.add(newTab)
+                            activeTabId = newTab.id
+                            inputUrl = if (newTab.url == "speeddown://home") "" else newTab.url
+                        },
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Add,
+                            contentDescription = "New Tab",
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    // 5. Tab Switcher Badge
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clickable { showTabsSheet = true },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(26.dp)
+                                .clip(RoundedCornerShape(7.dp))
+                                .border(
+                                    1.6.dp,
+                                    MaterialTheme.colorScheme.onSurface,
+                                    RoundedCornerShape(7.dp)
+                                ),
+                            contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
-                        }
-                        IconButton(
-                            onClick = { webViewInstance?.goForward() },
-                            enabled = canGoForward
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowForward, "Forward")
-                        }
-                        IconButton(onClick = {
-                            currentUrl = "https://www.google.com"
-                            inputUrl = currentUrl
-                            webViewInstance?.loadUrl(currentUrl)
-                        }) {
-                            Icon(Icons.Filled.Home, "Home")
+                            Text(
+                                text = "${tabs.size}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
                         }
                     }
 
-                    // Floating Media Sniffer Badge
-                    AnimatedVisibility(
-                        visible = detectedMedia.isNotEmpty(),
-                        enter = fadeIn() + scaleIn(),
-                        exit = fadeOut() + scaleOut()
+                    // 6. 3-Dot More Menu (with Video Capture Sniffer inside!)
+                    Box(
+                        modifier = Modifier.size(44.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Button(
-                            onClick = { showSnifferSheet = true },
-                            colors = ButtonDefaults.buttonColors(containerColor = Green),
-                            shape = RoundedCornerShape(20.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        IconButton(
+                            onClick = { showMoreMenu = true },
+                            modifier = Modifier.size(44.dp)
                         ) {
-                            Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                "Detected (${detectedMedia.size})",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp
+                            Box(contentAlignment = Alignment.TopEnd) {
+                                Icon(
+                                    Icons.Filled.MoreVert,
+                                    contentDescription = "More Options",
+                                    tint = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                if (detectedMedia.isNotEmpty()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(15.dp)
+                                            .clip(CircleShape)
+                                            .background(Green),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = if (detectedMedia.size > 9) "9+" else "${detectedMedia.size}",
+                                            fontSize = 9.sp,
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showMoreMenu,
+                            onDismissRequest = { showMoreMenu = false }
+                        ) {
+                            // Video Capture / Media Sniffer shifted inside 3-dot menu!
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            if (detectedMedia.isNotEmpty()) "Captured Media (${detectedMedia.size})" else "Media Sniffer",
+                                            fontWeight = if (detectedMedia.isNotEmpty()) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (detectedMedia.isNotEmpty()) Green else MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Spacer(Modifier.width(16.dp))
+                                        if (detectedMedia.isNotEmpty()) {
+                                            Surface(
+                                                color = Green,
+                                                shape = RoundedCornerShape(10.dp)
+                                            ) {
+                                                Text(
+                                                    text = "${detectedMedia.size} Ready",
+                                                    color = Color.White,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        } else {
+                                            Text(
+                                                "0 found",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                            )
+                                        }
+                                    }
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Filled.Download,
+                                        contentDescription = null,
+                                        tint = if (detectedMedia.isNotEmpty()) Green else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    showSnifferSheet = true
+                                }
+                            )
+
+                            // Reload Page
+                            DropdownMenuItem(
+                                text = { Text("Reload Page", fontWeight = FontWeight.Medium) },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Refresh, contentDescription = null, tint = Purple)
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    currentTab.webView?.reload()
+                                }
+                            )
+
+                            // Zoom Controls
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("Zoom Webpage", fontWeight = FontWeight.Medium)
+                                        Spacer(Modifier.width(16.dp))
+                                        Text(
+                                            "${browserSettings.textZoom}%",
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.ZoomIn, contentDescription = null, tint = Blue)
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    showZoomDialog = true
+                                }
+                            )
+
+                            // uBlock Ad Shield
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("uBlock Ad Shield", fontWeight = FontWeight.Medium)
+                                        Spacer(Modifier.width(16.dp))
+                                        if (adBlockEnabled && blockedCountState > 0) {
+                                            Surface(
+                                                color = Purple,
+                                                shape = RoundedCornerShape(10.dp)
+                                            ) {
+                                                Text(
+                                                    text = "$blockedCountState",
+                                                    color = Color.White,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Filled.Security,
+                                        contentDescription = null,
+                                        tint = if (adBlockEnabled) Green else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    blockedCountState = AdBlockEngine.blockedAdsCount
+                                    showAdBlockDialog = true
+                                }
+                            )
+
+                            // Desktop Site Switch
+                            DropdownMenuItem(
+                                text = {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("Desktop Site", fontWeight = FontWeight.Medium)
+                                        Spacer(Modifier.width(16.dp))
+                                        Checkbox(
+                                            checked = currentTab.isDesktopMode,
+                                            onCheckedChange = null,
+                                            colors = CheckboxDefaults.colors(checkedColor = Purple),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        if (currentTab.isDesktopMode) Icons.Filled.DesktopMac else Icons.Filled.Smartphone,
+                                        contentDescription = null,
+                                        tint = if (currentTab.isDesktopMode) Purple else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    currentTab.isDesktopMode = !currentTab.isDesktopMode
+                                    currentTab.webView?.settings?.userAgentString = if (currentTab.isDesktopMode) DESKTOP_UA else MOBILE_UA
+                                    currentTab.webView?.settings?.useWideViewPort = true
+                                    currentTab.webView?.settings?.loadWithOverviewMode = true
+                                    currentTab.webView?.reload()
+                                }
+                            )
+
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                            // Browser Settings
+                            DropdownMenuItem(
+                                text = { Text("Browser Settings", fontWeight = FontWeight.Medium) },
+                                leadingIcon = {
+                                    Icon(Icons.Filled.Tune, contentDescription = null, tint = MaterialTheme.colorScheme.onSurface)
+                                },
+                                onClick = {
+                                    showMoreMenu = false
+                                    showBrowserSettings = true
+                                }
                             )
                         }
                     }
@@ -184,73 +789,519 @@ fun BrowserScreen(
                 .padding(padding)
                 .fillMaxSize()
         ) {
-            if (webProgress in 1..99) {
+            if (currentTab.webProgress in 1..99) {
                 LinearProgressIndicator(
-                    progress = { webProgress / 100f },
-                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    progress = { currentTab.webProgress / 100f },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp),
                     color = Purple,
                     trackColor = Color.Transparent
                 )
             }
 
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        settings.apply {
-                            javaScriptEnabled = true
-                            domStorageEnabled = true
-                            databaseEnabled = true
-                            useWideViewPort = true
-                            loadWithOverviewMode = true
-                            userAgentString = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
+            val isHomePage = currentTab.url == "speeddown://home" || currentTab.url.isEmpty() || currentTab.url == "about:blank"
+            if (isHomePage) {
+                BrowserHomeScreen(
+                    settings = browserSettings,
+                    shortcuts = shortcuts,
+                    onNavigate = { targetUrl ->
+                        var target = targetUrl.trim()
+                        if (!target.startsWith("http://") && !target.startsWith("https://")) {
+                            target = if (target.contains(".") && !target.contains(" ")) {
+                                if (browserSettings.httpsOnly) "https://$target" else "http://$target"
+                            } else {
+                                browserSettings.getSearchUrl(target)
+                            }
+                        } else if (browserSettings.httpsOnly && target.startsWith("http://", ignoreCase = true)) {
+                            target = "https://" + target.substring(7)
+                        }
+                        currentTab.url = target
+                        inputUrl = target
+                        currentTab.webView?.loadUrl(target)
+                    },
+                    onOpenSettings = { showBrowserSettings = true },
+                    onAddShortcut = { title, url ->
+                        coroutineScope.launch {
+                            browserSettingsStore.addShortcut(title, url)
+                        }
+                        Toast.makeText(context, "Added shortcut: $title", Toast.LENGTH_SHORT).show()
+                    },
+                    onRemoveShortcut = { id ->
+                        coroutineScope.launch {
+                            browserSettingsStore.removeShortcut(id)
+                        }
+                        Toast.makeText(context, "Shortcut removed", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                // WebViews Container for multiple tabs
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        FrameLayout(ctx).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                        }
+                    },
+                    update = { container ->
+                        if (currentTab.webView == null) {
+                            currentTab.webView = createTabWebView(
+                                context = context,
+                                tab = currentTab,
+                                browserSettings = browserSettings,
+                                detectedMedia = detectedMedia,
+                                onUrlChanged = { newUrl ->
+                                    if (currentTab.id == activeTabId) {
+                                        inputUrl = newUrl
+                                    }
+                                },
+                                onAdBlocked = {
+                                    blockedCountState = AdBlockEngine.blockedAdsCount
+                                },
+                                onShowCustomView = { v, callback ->
+                                    customFullscreenView = v
+                                    customFullscreenCallback = callback
+                                },
+                                onHideCustomView = {
+                                    customFullscreenCallback?.onCustomViewHidden()
+                                    customFullscreenView = null
+                                    customFullscreenCallback = null
+                                },
+                                onStartDownload = onStartDownload
+                            )
                         }
 
-                        webViewClient = object : WebViewClient() {
-                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                super.onPageStarted(view, url, favicon)
-                                url?.let {
-                                    inputUrl = it
-                                    currentUrl = it
-                                }
-                                canGoBack = canGoBack()
-                                canGoForward = canGoForward()
-                            }
-
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                super.onPageFinished(view, url)
-                                pageTitle = view?.title ?: "SpeedDown Browser"
-                                canGoBack = canGoBack()
-                                canGoForward = canGoForward()
-                            }
-
-                            override fun shouldInterceptRequest(
-                                view: WebView?,
-                                request: WebResourceRequest?
-                            ): WebResourceResponse? {
-                                val reqUrl = request?.url?.toString() ?: ""
-                                sniffMediaUrl(reqUrl, detectedMedia)
-                                return super.shouldInterceptRequest(view, request)
+                        val activeView = currentTab.webView
+                        if (activeView != null) {
+                            val currentChild = if (container.childCount > 0) container.getChildAt(0) else null
+                            if (currentChild !== activeView) {
+                                container.removeAllViews()
+                                (activeView.parent as? ViewGroup)?.removeView(activeView)
+                                container.addView(
+                                    activeView,
+                                    FrameLayout.LayoutParams(
+                                        FrameLayout.LayoutParams.MATCH_PARENT,
+                                        FrameLayout.LayoutParams.MATCH_PARENT
+                                    )
+                                )
                             }
                         }
-
-                        webChromeClient = object : WebChromeClient() {
-                            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                                webProgress = newProgress
-                            }
-                        }
-
-                        loadUrl(currentUrl)
-                        webViewInstance = this
                     }
-                },
-                update = { webViewInstance = it }
-            )
+                )
+            }
         }
+    }
+
+    // Tabs Management Bottom Sheet
+    if (showTabsSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showTabsSheet = false },
+            containerColor = MaterialTheme.colorScheme.surface
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Tabs (${tabs.size})", fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        TextButton(
+                            onClick = {
+                                val newTab = BrowserTabItem(
+                                    initialUrl = browserSettings.getHomeUrl(),
+                                    isIncognito = false
+                                ).apply {
+                                    isDesktopMode = browserSettings.defaultDesktopMode
+                                }
+                                tabs.add(newTab)
+                                activeTabId = newTab.id
+                                inputUrl = if (newTab.url == "speeddown://home") "" else newTab.url
+                                showTabsSheet = false
+                            }
+                        ) {
+                            Icon(Icons.Filled.Add, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(2.dp))
+                            Text("New Tab", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+
+                        TextButton(
+                            onClick = {
+                                val newTab = BrowserTabItem(
+                                    initialUrl = browserSettings.getHomeUrl(),
+                                    isIncognito = true
+                                ).apply {
+                                    isDesktopMode = browserSettings.defaultDesktopMode
+                                }
+                                tabs.add(newTab)
+                                activeTabId = newTab.id
+                                inputUrl = if (newTab.url == "speeddown://home") "" else newTab.url
+                                showTabsSheet = false
+                            }
+                        ) {
+                            Icon(Icons.Filled.VpnKey, null, modifier = Modifier.size(16.dp), tint = Amber)
+                            Spacer(Modifier.width(2.dp))
+                            Text("Incognito", fontWeight = FontWeight.Bold, color = Amber, fontSize = 12.sp)
+                        }
+
+                        if (tabs.size > 1) {
+                            TextButton(
+                                onClick = {
+                                    tabs.filter { it.id != activeTabId }.forEach {
+                                        it.webView?.let { wv ->
+                                            (wv.parent as? ViewGroup)?.removeView(wv)
+                                            wv.stopLoading()
+                                            wv.clearHistory()
+                                            wv.removeAllViews()
+                                            wv.destroy()
+                                        }
+                                        it.webView = null
+                                    }
+                                    tabs.removeAll { it.id != activeTabId }
+                                }
+                            ) {
+                                Text("Close Others", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                ) {
+                    items(tabs, key = { it.id }) { tab ->
+                        val isSelected = tab.id == activeTabId
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = if (isSelected) Purple.copy(0.12f) else MaterialTheme.colorScheme.surfaceVariant.copy(0.4f),
+                            border = if (isSelected) BorderStroke(1.8.dp, Purple) else null,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(110.dp)
+                                .clickable {
+                                    activeTabId = tab.id
+                                    inputUrl = tab.url
+                                    showTabsSheet = false
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(10.dp),
+                                verticalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = tab.title,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    IconButton(
+                                        onClick = {
+                                            tab.webView?.let { wv ->
+                                                (wv.parent as? ViewGroup)?.removeView(wv)
+                                                wv.stopLoading()
+                                                wv.clearHistory()
+                                                wv.removeAllViews()
+                                                wv.destroy()
+                                            }
+                                            tab.webView = null
+                                            val index = tabs.indexOf(tab)
+                                            tabs.remove(tab)
+                                            if (tabs.isEmpty()) {
+                                                val fresh = BrowserTabItem(initialUrl = browserSettings.getHomeUrl())
+                                                tabs.add(fresh)
+                                                activeTabId = fresh.id
+                                                inputUrl = ""
+                                            } else if (activeTabId == tab.id) {
+                                                val next = (index - 1).coerceAtLeast(0)
+                                                activeTabId = tabs[next].id
+                                                inputUrl = if (tabs[next].url == "speeddown://home") "" else tabs[next].url
+                                            }
+                                        },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(Icons.Filled.Close, "Close Tab", modifier = Modifier.size(16.dp))
+                                    }
+                                }
+
+                                Text(
+                                    text = tab.url.replace("https://", "").replace("http://", ""),
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (tab.isIncognito) {
+                                        Text("🕶️ Incognito", fontSize = 9.sp, color = Amber, fontWeight = FontWeight.Bold)
+                                    }
+                                    if (tab.isDesktopMode) {
+                                        Text("🖥️ Desktop", fontSize = 9.sp, color = Blue, fontWeight = FontWeight.Bold)
+                                    }
+                                    if (isSelected) {
+                                        Text("● Active", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Purple)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
+        }
+    }
+
+    // uBlock Shield Dialog
+    if (showAdBlockDialog) {
+        AlertDialog(
+            onDismissRequest = { showAdBlockDialog = false },
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(if (adBlockEnabled) Green.copy(0.15f) else MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.Security,
+                        null,
+                        tint = if (adBlockEnabled) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            },
+            title = {
+                Text("uBlock Ad Shield", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text("Block Ads & Popups", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text(
+                                if (adBlockEnabled) "uBlock Protection Active" else "Protection Paused",
+                                fontSize = 12.sp,
+                                color = if (adBlockEnabled) Green else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = adBlockEnabled,
+                            onCheckedChange = {
+                                adBlockEnabled = it
+                                AdBlockEngine.isEnabled = it
+                            }
+                        )
+                    }
+
+                    HorizontalDivider()
+
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(0.3f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("Total Threats & Ads Blocked", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "$blockedCountState Blocked",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 22.sp,
+                                color = Green
+                            )
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("🛡️ uBlock Scriptlet Defusers (Defuses window.open & popunders)", fontSize = 12.sp)
+                        Text("🚫 EasyList Domain Filter (Blocks video ads & banners)", fontSize = 12.sp)
+                        Text("⚡ Click-Hijack Shield (Stops redirect on video click)", fontSize = 12.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showAdBlockDialog = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                ) {
+                    Text("Done")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    AdBlockEngine.resetCount()
+                    blockedCountState = 0
+                }) {
+                    Text("Reset Count")
+                }
+            }
+        )
+    }
+
+    // Webpage Zoom Controls Dialog
+    if (showZoomDialog) {
+        var currentZoom by remember { mutableIntStateOf(currentTab.webView?.settings?.textZoom ?: browserSettings.textZoom) }
+        AlertDialog(
+            onDismissRequest = { showZoomDialog = false },
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(Purple.copy(0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Filled.ZoomIn, null, tint = Purple, modifier = Modifier.size(28.dp))
+                }
+            },
+            title = {
+                Text("Webpage Zoom Controls", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "$currentZoom%",
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Purple
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                val next = (currentZoom - 10).coerceAtLeast(50)
+                                currentZoom = next
+                                currentTab.webView?.settings?.textZoom = next
+                                currentTab.webView?.zoomOut()
+                                coroutineScope.launch {
+                                    browserSettingsStore.updateSettings(browserSettings.copy(textZoom = next))
+                                }
+                            },
+                            shape = CircleShape,
+                            modifier = Modifier.size(48.dp),
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Icon(Icons.Filled.Remove, "Zoom Out")
+                        }
+
+                        Button(
+                            onClick = {
+                                currentZoom = 100
+                                currentTab.webView?.settings?.textZoom = 100
+                                coroutineScope.launch {
+                                    browserSettingsStore.updateSettings(browserSettings.copy(textZoom = 100))
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("100% (Reset)", color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                val next = (currentZoom + 10).coerceAtMost(300)
+                                currentZoom = next
+                                currentTab.webView?.settings?.textZoom = next
+                                currentTab.webView?.zoomIn()
+                                coroutineScope.launch {
+                                    browserSettingsStore.updateSettings(browserSettings.copy(textZoom = next))
+                                }
+                            },
+                            shape = CircleShape,
+                            modifier = Modifier.size(48.dp),
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Icon(Icons.Filled.Add, "Zoom In")
+                        }
+                    }
+
+                    Slider(
+                        value = currentZoom.toFloat(),
+                        onValueChange = {
+                            val v = it.toInt()
+                            currentZoom = v
+                            currentTab.webView?.settings?.textZoom = v
+                        },
+                        onValueChangeFinished = {
+                            coroutineScope.launch {
+                                browserSettingsStore.updateSettings(browserSettings.copy(textZoom = currentZoom))
+                            }
+                        },
+                        valueRange = 50f..250f,
+                        steps = 19,
+                        colors = SliderDefaults.colors(thumbColor = Purple, activeTrackColor = Purple)
+                    )
+
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Filled.TouchApp, null, tint = Purple, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Tip: You can also pinch-to-zoom anywhere on any webpage with two fingers.",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { showZoomDialog = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                ) {
+                    Text("Done")
+                }
+            }
+        )
     }
 
     // Sniffer Media Bottom Sheet
@@ -282,7 +1333,10 @@ fun BrowserScreen(
                         Spacer(Modifier.width(10.dp))
                         Text("Captured Downloads", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                     }
-                    TextButton(onClick = { detectedMedia.clear() }) {
+                    TextButton(onClick = {
+                        detectedMedia.clear()
+                        detectedUrlsCache.clear()
+                    }) {
                         Text("Clear All", color = MaterialTheme.colorScheme.error)
                     }
                 }
@@ -343,11 +1397,81 @@ fun BrowserScreen(
                                             )
                                         }
                                     }
-                                    Spacer(Modifier.width(8.dp))
+                                    Spacer(Modifier.width(6.dp))
+
+                                    // In-App Mini Video Preview
+                                    if (media.type.contains("Video")) {
+                                        OutlinedButton(
+                                            onClick = { previewMedia = media },
+                                            shape = RoundedCornerShape(10.dp),
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Visibility, null, modifier = Modifier.size(14.dp), tint = Purple)
+                                            Spacer(Modifier.width(2.dp))
+                                            Text("Preview", fontSize = 11.sp, color = Purple, fontWeight = FontWeight.Bold)
+                                        }
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+
+                                    // Direct Play in Nothing Player / External Player
+                                    if (media.type.contains("Video") || media.type.contains("Audio")) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                try {
+                                                    val playIntent = Intent(Intent.ACTION_VIEW).apply {
+                                                        setDataAndType(Uri.parse(media.url), if (media.type.contains("Video")) "video/*" else "audio/*")
+                                                        setPackage("com.nothing.player")
+                                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    }
+                                                    context.startActivity(playIntent)
+                                                } catch (_: Exception) {
+                                                    try {
+                                                        val fallbackIntent = Intent(Intent.ACTION_VIEW).apply {
+                                                            setDataAndType(Uri.parse(media.url), if (media.type.contains("Video")) "video/*" else "audio/*")
+                                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                        }
+                                                        context.startActivity(fallbackIntent)
+                                                    } catch (_: Exception) {}
+                                                }
+                                                showSnifferSheet = false
+                                            },
+                                            shape = RoundedCornerShape(10.dp),
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                                        ) {
+                                            Icon(Icons.Filled.PlayArrow, null, modifier = Modifier.size(14.dp), tint = Green)
+                                            Spacer(Modifier.width(2.dp))
+                                            Text("Play", fontSize = 11.sp, color = Green, fontWeight = FontWeight.Bold)
+                                        }
+                                        Spacer(Modifier.width(6.dp))
+                                    }
+
                                     Button(
                                         onClick = {
-                                            onStartDownload(media.url, media.fileName, 32)
-                                            showSnifferSheet = false
+                                            if (media.url.contains(".m3u8", ignoreCase = true)) {
+                                                isResolvingHls = true
+                                                coroutineScope.launch(Dispatchers.IO) {
+                                                    val client = OkHttpClient.Builder()
+                                                        .dns(SecureDnsHelper.createOkHttpDns(browserSettings.dnsProvider, browserSettings.customDnsIp))
+                                                        .connectTimeout(8, TimeUnit.SECONDS)
+                                                        .readTimeout(10, TimeUnit.SECONDS)
+                                                        .build()
+                                                    val hlsParser = com.example.speeddown.engine.HlsDownloader(client, com.example.speeddown.data.DownloadStore.getInstance(context))
+                                                    val variants = hlsParser.parseVariantStreams(media.url)
+                                                    withContext(Dispatchers.Main) {
+                                                        isResolvingHls = false
+                                                        if (variants.size > 1) {
+                                                            hlsVariantsToPick = variants
+                                                            hlsTargetMedia = media
+                                                        } else {
+                                                            onStartDownload(media.url, media.fileName, 32)
+                                                            showSnifferSheet = false
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                onStartDownload(media.url, media.fileName, 32)
+                                                showSnifferSheet = false
+                                            }
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = Purple),
                                         shape = RoundedCornerShape(10.dp),
@@ -364,29 +1488,497 @@ fun BrowserScreen(
             }
         }
     }
+
+    // In-App Video Preview Dialog
+    previewMedia?.let { pMedia ->
+        AlertDialog(
+            onDismissRequest = { previewMedia = null },
+            title = {
+                Text(
+                    pMedia.fileName,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(230.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    AndroidView(
+                        factory = { ctx ->
+                            android.widget.VideoView(ctx).apply {
+                                layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                                val mediaController = android.widget.MediaController(ctx)
+                                mediaController.setAnchorView(this)
+                                setMediaController(mediaController)
+                                setVideoURI(Uri.parse(pMedia.url))
+                                setOnPreparedListener { mp ->
+                                    mp.isLooping = true
+                                    start()
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val url = pMedia.url
+                        val name = pMedia.fileName
+                        previewMedia = null
+                        showSnifferSheet = false
+                        onStartDownload(url, name, 32)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                ) {
+                    Text("Download")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { previewMedia = null }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    // HLS Stream Quality Picker Dialog
+    if (hlsVariantsToPick != null && hlsTargetMedia != null) {
+        AlertDialog(
+            onDismissRequest = {
+                hlsVariantsToPick = null
+                hlsTargetMedia = null
+            },
+            icon = {
+                Icon(Icons.Filled.HighQuality, null, tint = Purple, modifier = Modifier.size(32.dp))
+            },
+            title = {
+                Text("Select Video Quality", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = hlsTargetMedia?.fileName ?: "HLS Video Stream",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 260.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(hlsVariantsToPick ?: emptyList()) { variant ->
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                border = BorderStroke(1.dp, Purple.copy(alpha = 0.3f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val target = hlsTargetMedia
+                                        hlsVariantsToPick = null
+                                        hlsTargetMedia = null
+                                        showSnifferSheet = false
+                                        if (target != null) {
+                                            val cleanName = target.fileName.substringBeforeLast(".")
+                                            val qualitySuffix = variant.label.replace(" ", "_")
+                                            onStartDownload(variant.url, "${cleanName}_$qualitySuffix.mp4", 32)
+                                        }
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text(variant.label, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                        Text(variant.resolution, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = Purple.copy(alpha = 0.15f)
+                                    ) {
+                                        Text(
+                                            if (variant.bandwidth > 0) "${variant.bandwidth / 1000} kbps" else "Stream",
+                                            color = Purple,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val target = hlsTargetMedia
+                    hlsVariantsToPick = null
+                    hlsTargetMedia = null
+                    showSnifferSheet = false
+                    if (target != null) {
+                        onStartDownload(target.url, target.fileName, 32)
+                    }
+                }) {
+                    Text("Auto / Best Quality")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    hlsVariantsToPick = null
+                    hlsTargetMedia = null
+                }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Fullscreen HTML5 Video View (Overlays entire screen when video enters fullscreen)
+    customFullscreenView?.let { fView ->
+        BackHandler {
+            customFullscreenCallback?.onCustomViewHidden()
+            customFullscreenView = null
+            customFullscreenCallback = null
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            AndroidView(
+                factory = {
+                    (fView.parent as? ViewGroup)?.removeView(fView)
+                    fView
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+private fun createTabWebView(
+    context: Context,
+    tab: BrowserTabItem,
+    browserSettings: BrowserSettings,
+    detectedMedia: MutableList<SniffedMedia>,
+    onUrlChanged: (String) -> Unit,
+    onAdBlocked: () -> Unit,
+    onShowCustomView: (View, WebChromeClient.CustomViewCallback) -> Unit,
+    onHideCustomView: () -> Unit,
+    onStartDownload: (url: String, fileName: String, threads: Int) -> Unit
+): WebView {
+    return WebView(context).apply {
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        settings.apply {
+            javaScriptEnabled = browserSettings.javaScriptEnabled
+            textZoom = browserSettings.textZoom
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                @Suppress("DEPRECATION")
+                forceDark = if (browserSettings.forceDarkMode) WebSettings.FORCE_DARK_ON else WebSettings.FORCE_DARK_OFF
+            }
+            domStorageEnabled = !tab.isIncognito
+            databaseEnabled = !tab.isIncognito
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            mediaPlaybackRequiresUserGesture = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            allowFileAccess = !tab.isIncognito
+            allowContentAccess = true
+            cacheMode = if (tab.isIncognito) WebSettings.LOAD_NO_CACHE else WebSettings.LOAD_DEFAULT
+            setSupportMultipleWindows(false) // Blocks rogue popup window spawns
+            javaScriptCanOpenWindowsAutomatically = !browserSettings.blockPopups && false
+            userAgentString = if (tab.isDesktopMode) DESKTOP_UA else MOBILE_UA
+        }
+
+        // Enable third-party cookies if configured and not incognito
+        val currentWebView = this
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(!tab.isIncognito)
+        cookieManager.setAcceptThirdPartyCookies(currentWebView, browserSettings.acceptThirdPartyCookies && !tab.isIncognito)
+
+        // Bridge for media sniffer
+        addJavascriptInterface(object {
+            @JavascriptInterface
+            fun onMediaFound(streamUrl: String, title: String) {
+                sniffMediaUrl(streamUrl, detectedMedia)
+            }
+        }, "SpeedDownBridge")
+
+        // Bridge for uBlock Origin defusers in web context
+        addJavascriptInterface(object {
+            @JavascriptInterface
+            fun isAdUrl(url: String): Boolean {
+                return AdBlockEngine.isAd(url) || AdBlockEngine.isRogueRedirect(url)
+            }
+
+            @JavascriptInterface
+            fun notifyAdBlocked() {
+                AdBlockEngine.recordBlock()
+                mainHandler.post { onAdBlocked() }
+            }
+        }, "SpeedDownAdBlock")
+
+        webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                url?.let {
+                    tab.url = it
+                    onUrlChanged(it)
+                }
+                tab.canGoBack = canGoBack()
+                tab.canGoForward = canGoForward()
+
+                // Privacy: Do Not Track & Global Privacy Control signals
+                if (browserSettings.doNotTrack) {
+                    view?.evaluateJavascript(
+                        "try { Object.defineProperty(navigator, 'doNotTrack', { value: '1', configurable: true }); Object.defineProperty(navigator, 'globalPrivacyControl', { value: true, configurable: true }); } catch(e){}",
+                        null
+                    )
+                }
+
+                // Inject uBlock Origin defusers immediately at page start before site scripts run
+                if (AdBlockEngine.isEnabled) {
+                    view?.evaluateJavascript(AdBlockEngine.UBLOCK_SCRIPTLET_DEFUSER_JS, null)
+                }
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                tab.title = view?.title ?: "Page"
+                tab.canGoBack = canGoBack()
+                tab.canGoForward = canGoForward()
+
+                // Re-inject uBlock defusers and cosmetic CSS ad filter
+                if (AdBlockEngine.isEnabled) {
+                    view?.evaluateJavascript(AdBlockEngine.UBLOCK_SCRIPTLET_DEFUSER_JS, null)
+                    view?.evaluateJavascript(AdBlockEngine.COSMETIC_AD_BLOCK_JS, null)
+                }
+
+                // Auto-sniff embedded HTML5 video/audio elements and source tags
+                view?.evaluateJavascript(
+                    """
+                    (function() {
+                        function inspect() {
+                            var els = document.querySelectorAll('video, audio');
+                            for (var i = 0; i < els.length; i++) {
+                                var v = els[i];
+                                if (v.src && v.src.indexOf('http') === 0) {
+                                    window.SpeedDownBridge && window.SpeedDownBridge.onMediaFound(v.src, document.title || 'Video Stream');
+                                }
+                                var srcs = v.querySelectorAll('source');
+                                for (var j = 0; j < srcs.length; j++) {
+                                    if (srcs[j].src && srcs[j].src.indexOf('http') === 0) {
+                                        window.SpeedDownBridge && window.SpeedDownBridge.onMediaFound(srcs[j].src, document.title || 'Video Stream');
+                                    }
+                                }
+                            }
+                        }
+                        inspect();
+                        setInterval(inspect, 2500);
+                    })();
+                    """.trimIndent(),
+                    null
+                )
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val reqUrl = request?.url?.toString() ?: return false
+
+                // 0. HTTPS-Only Mode upgrade
+                if (browserSettings.httpsOnly && reqUrl.startsWith("http://", ignoreCase = true)) {
+                    val upgraded = "https://" + reqUrl.substring(7)
+                    view?.loadUrl(upgraded)
+                    return true
+                }
+
+                // 1. Allow internal scheme navigations for video players, blobs, and scripts
+                if (reqUrl.startsWith("javascript:", ignoreCase = true) ||
+                    reqUrl.startsWith("about:", ignoreCase = true) ||
+                    reqUrl.startsWith("blob:", ignoreCase = true) ||
+                    reqUrl.startsWith("data:", ignoreCase = true)
+                ) {
+                    return false
+                }
+
+                // 2. AGGRESSIVE BLOCK: Check if this destination URL is an ad or rogue redirect
+                if (AdBlockEngine.isAd(reqUrl) || AdBlockEngine.isRogueRedirect(reqUrl)) {
+                    AdBlockEngine.recordBlock()
+                    mainHandler.post { onAdBlocked() }
+                    return true // Handled: DROP popup/redirect completely!
+                }
+
+                // 3. Media & Download handling:
+                if (isDirectDownloadUrl(reqUrl)) {
+                    sniffMediaUrl(reqUrl, detectedMedia)
+                    val clean = reqUrl.substringBefore("?").substringBefore("#").lowercase()
+                    val isFileArchive = clean.endsWith(".zip") || clean.endsWith(".rar") ||
+                            clean.endsWith(".7z") || clean.endsWith(".apk") || clean.endsWith(".torrent") ||
+                            reqUrl.startsWith("magnet:", ignoreCase = true)
+                    if (isFileArchive) {
+                        if (reqUrl.startsWith("magnet:", ignoreCase = true)) {
+                            val dn = Uri.parse(reqUrl).getQueryParameter("dn") ?: "Torrent_${System.currentTimeMillis()}"
+                            onStartDownload(reqUrl, dn, 8)
+                            mainHandler.post {
+                                Toast.makeText(context, "Added Magnet Torrent to SpeedDown", Toast.LENGTH_SHORT).show()
+                            }
+                        } else if (clean.endsWith(".torrent")) {
+                            val tName = reqUrl.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                            onStartDownload(reqUrl, tName, 8)
+                            mainHandler.post {
+                                Toast.makeText(context, "Added Torrent to SpeedDown", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        return true
+                    }
+                    // For video/audio streams (.mp4, .m3u8, .webm), allow WebView to play natively!
+                    return false
+                }
+
+                // 4. Block rogue non-http/https schemes (intent://, market://, tel://, etc.)
+                if (!reqUrl.startsWith("http://", ignoreCase = true) && !reqUrl.startsWith("https://", ignoreCase = true)) {
+                    AdBlockEngine.recordBlock()
+                    mainHandler.post { onAdBlocked() }
+                    return true
+                }
+
+                return super.shouldOverrideUrlLoading(view, request)
+            }
+
+            override fun shouldInterceptRequest(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): WebResourceResponse? {
+                val reqUrl = request?.url?.toString() ?: ""
+
+                // Intercept & block ad networks / trackers
+                if (AdBlockEngine.isAd(reqUrl)) {
+                    AdBlockEngine.recordBlock()
+                    mainHandler.post { onAdBlocked() }
+                    return AdBlockEngine.createEmptyResponse()
+                }
+
+                sniffMediaUrl(reqUrl, detectedMedia)
+                return super.shouldInterceptRequest(view, request)
+            }
+        }
+
+        webChromeClient = object : WebChromeClient() {
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message?
+            ): Boolean {
+                // Completely block all window.open popup window requests
+                if (AdBlockEngine.isEnabled) {
+                    AdBlockEngine.recordBlock()
+                    mainHandler.post { onAdBlocked() }
+                    return false
+                }
+                return false
+            }
+
+            override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                if (view != null && callback != null) {
+                    onShowCustomView(view, callback)
+                }
+            }
+
+            override fun onHideCustomView() {
+                onHideCustomView()
+            }
+
+            override fun getDefaultVideoPoster(): Bitmap? {
+                return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+            }
+
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                tab.webProgress = newProgress
+                // Inject early at 25% and 60% progress before ad scripts set up overlays
+                if (AdBlockEngine.isEnabled && (newProgress == 25 || newProgress == 60)) {
+                    view?.evaluateJavascript(AdBlockEngine.UBLOCK_SCRIPTLET_DEFUSER_JS, null)
+                }
+            }
+        }
+
+        loadUrl(tab.url)
+    }
+}
+
+private fun isDirectDownloadUrl(url: String): Boolean {
+    val clean = url.substringBefore("?").substringBefore("#").lowercase()
+    return clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") ||
+            clean.endsWith(".m3u8") || clean.endsWith(".mpd") || clean.endsWith(".mp3") ||
+            clean.endsWith(".zip") || clean.endsWith(".rar") || clean.endsWith(".apk") ||
+            clean.endsWith(".torrent") || url.startsWith("magnet:", ignoreCase = true)
 }
 
 private fun sniffMediaUrl(url: String, list: MutableList<SniffedMedia>) {
+    if (url.isBlank()) return
+    if (detectedUrlsCache.contains(url)) return
+
     val clean = url.substringBefore("?").substringBefore("#").lowercase()
     val mediaType = when {
-        clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") -> "Video (MP4/MKV)"
-        clean.endsWith(".m3u8") || clean.endsWith(".mpd") -> "Video Stream (HLS/DASH)"
+        clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") || url.contains("mime=video") -> "Video (MP4/MKV)"
+        clean.endsWith(".m3u8") || url.contains(".m3u8") -> "Video Stream (HLS M3U8)"
+        clean.endsWith(".mpd") || url.contains(".mpd") -> "Video Stream (DASH MPD)"
         clean.endsWith(".mp3") || clean.endsWith(".m4a") || clean.endsWith(".aac") || clean.endsWith(".flac") -> "Audio (MP3/M4A)"
         clean.endsWith(".zip") || clean.endsWith(".rar") || clean.endsWith(".7z") || clean.endsWith(".tar.gz") -> "Archive (ZIP/RAR)"
         clean.endsWith(".apk") || clean.endsWith(".xapk") -> "App Package (APK)"
         clean.endsWith(".pdf") || clean.endsWith(".epub") -> "Document (PDF)"
         clean.endsWith(".iso") || clean.endsWith(".img") -> "Disk Image (ISO)"
+        clean.endsWith(".torrent") -> "BitTorrent (.torrent)"
+        url.startsWith("magnet:?xt=urn:btih:", ignoreCase = true) -> "Magnet Torrent Link"
         else -> null
     } ?: return
 
+    if (!detectedUrlsCache.add(url)) return
+
     val fileName = try {
-        val raw = url.substringAfterLast("/").substringBefore("?").substringBefore("#")
-        if (raw.isNotBlank()) java.net.URLDecoder.decode(raw, "UTF-8") else "media_${System.currentTimeMillis()}"
+        if (url.startsWith("magnet:", ignoreCase = true)) {
+            val dn = android.net.Uri.parse(url).getQueryParameter("dn")
+            dn ?: "torrent_${System.currentTimeMillis()}"
+        } else {
+            val raw = url.substringAfterLast("/").substringBefore("?").substringBefore("#")
+            if (raw.isNotBlank()) java.net.URLDecoder.decode(raw, "UTF-8") else "media_${System.currentTimeMillis()}"
+        }
     } catch (_: Exception) {
         "media_${System.currentTimeMillis()}"
     }
 
-    if (list.none { it.url == url }) {
-        list.add(0, SniffedMedia(url = url, fileName = fileName, type = mediaType))
+    // Strictly mutate Compose SnapshotStateList on Main Looper to guarantee ZERO ConcurrentModificationException!
+    mainHandler.post {
+        if (list.none { it.url == url }) {
+            list.add(0, SniffedMedia(url = url, fileName = fileName, type = mediaType))
+        }
     }
 }

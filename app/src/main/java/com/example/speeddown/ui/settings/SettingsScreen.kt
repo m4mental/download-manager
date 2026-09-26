@@ -1,5 +1,10 @@
 package com.example.speeddown.ui.settings
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -460,6 +465,91 @@ fun SettingsScreen(
                             )
                         }
                     }
+                }
+            }
+
+            // ─── Section: Background Shield & Battery (Android 14) ───────────
+            item {
+                val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
+                var isIgnoringBattery by remember {
+                    mutableStateOf(powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true)
+                }
+
+                SettingsSectionCard(
+                    title = "Background Download Shield",
+                    icon = Icons.Filled.BatteryChargingFull,
+                    iconTint = if (isIgnoringBattery) Green else Amber
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Android 14 Doze Protection",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                if (isIgnoringBattery) "Unrestricted battery active (Zero download freeze)"
+                                else "Restricted by OS (May pause when screen turns off)",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = if (isIgnoringBattery) Green.copy(alpha = 0.15f) else Amber.copy(alpha = 0.15f),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (isIgnoringBattery) Green.copy(alpha = 0.5f) else Amber.copy(alpha = 0.5f)
+                            )
+                        ) {
+                            Text(
+                                text = if (isIgnoringBattery) "Shield Active" else "Needs Setup",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isIgnoringBattery) Green else Amber,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    if (!isIgnoringBattery) {
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = {
+                                try {
+                                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                        data = Uri.parse("package:${context.packageName}")
+                                    }
+                                    context.startActivity(intent)
+                                } catch (_: Exception) {
+                                    try {
+                                        val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                        context.startActivity(fallback)
+                                    } catch (_: Exception) {
+                                        Toast.makeText(context, "Please disable battery restriction in Settings", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Filled.Bolt, null, modifier = Modifier.size(16.dp), tint = Amber)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Grant Unrestricted Battery (No Sleep)", color = Amber, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "⚡ SpeedDown holds a high-priority CPU partial wake-lock and foreground data-sync service so downloads never freeze in deep sleep.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 

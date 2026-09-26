@@ -43,12 +43,27 @@ class DownloadRepository(private val context: Context) {
             appExtDir ?: publicDir
         }
 
-        val sanitizedFileName = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
-            .ifBlank { "download_${System.currentTimeMillis()}" }
+        val cleanUrl = url.trim()
+        val isMagnet = com.example.speeddown.engine.TorrentEngine.isMagnet(cleanUrl)
+        val isHls = cleanUrl.contains(".m3u8", ignoreCase = true)
+        val magnetMetadata = if (isMagnet) com.example.speeddown.engine.TorrentEngine.parseMagnet(cleanUrl) else null
+
+        val sanitizedFileName = if (isMagnet && magnetMetadata != null) {
+            magnetMetadata.displayName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+        } else {
+            fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+                .ifBlank { "download_${System.currentTimeMillis()}" }
+        }
 
         val settingsSnapshot = store.getSettingsSnapshot()
         val effectiveThreads = if (threads <= 0) settingsSnapshot.defaultThreads else threads
-        val category = determineCategory(sanitizedFileName)
+        val category = when {
+            isMagnet -> "Torrents"
+            isHls -> "Videos"
+            else -> determineCategory(sanitizedFileName)
+        }
+        val isStreamable = category == "Videos" || category == "Music" || isHls || isMagnet
+
         val targetDir = if (settingsSnapshot.autoCategorize) {
             File(baseDownloadsDir, "SpeedDown/$category")
         } else {
@@ -59,16 +74,137 @@ class DownloadRepository(private val context: Context) {
         val filePath = "${targetDir.absolutePath}/$sanitizedFileName"
 
         val item = DownloadItem(
-            url = url.trim(),
+            url = cleanUrl,
             fileName = sanitizedFileName,
             filePath = filePath,
             threads = effectiveThreads,
             status = DownloadStatus.QUEUED,
-            category = category
+            category = category,
+            isStreamable = isStreamable,
+            isTorrent = isMagnet,
+            isHls = isHls
         )
         store.upsert(item)
         startServiceAction(DownloadService.ACTION_START, item.id)
         return item.id
+    }
+
+    fun checkDuplicateFile(fileName: String): File? {
+        val sanitized = fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+        val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val appExtDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        val candidateDirs = listOfNotNull(
+            File(publicDir, "SpeedDown/Videos"),
+            File(publicDir, "SpeedDown/Music"),
+            File(publicDir, "SpeedDown/Archives"),
+            File(publicDir, "SpeedDown/Documents"),
+            File(publicDir, "SpeedDown/Files"),
+            File(publicDir, "SpeedDown/Torrents"),
+            File(publicDir, "SpeedDown"),
+            publicDir,
+            appExtDir
+        )
+        return candidateDirs.map { File(it, sanitized) }.firstOrNull { it.exists() && it.length() > 0 }
+    }
+
+    suspend fun refreshDownloadUrl(downloadId: Long, newUrl: String) {
+        store.updateUrl(downloadId, newUrl.trim())
+        store.updateStatus(downloadId, DownloadStatus.DOWNLOADING)
+        startServiceAction(DownloadService.ACTION_RESUME, downloadId)
+    }
+
+    fun streamInNothingPlayer(item: DownloadItem): Boolean {
+        val streamServer = com.example.speeddown.engine.LocalStreamServer.getInstance(store)
+        val streamUrl = streamServer.getStreamUrl(item.id, item.fileName)
+        val uri = Uri.parse(streamUrl)
+        return try {
+            val intent = Intent().apply {
+                setClassName("com.nothing.player", "com.nothing.player.ExoVideoPlayerActivity")
+                putExtra("path", streamUrl)
+                putExtra("video_path", streamUrl)
+                putExtra("title", item.fileName)
+                putExtra("video_title", item.fileName)
+                putExtra("contentUri", streamUrl)
+                putExtra("video_uri", streamUrl)
+                setDataAndType(uri, "video/*")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            true
+        } catch (_: Exception) {
+            try {
+                val genericIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "video/*")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(genericIntent)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    data class StorageBreakdown(
+        val videoBytes: Long,
+        val musicBytes: Long,
+        val archiveBytes: Long,
+        val docBytes: Long,
+        val otherBytes: Long,
+        val totalBytes: Long,
+        val orphanedPartBytes: Long
+    )
+
+    suspend fun calculateStorageBreakdown(): StorageBreakdown = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val speedDownDir = File(publicDir, "SpeedDown")
+        var vBytes = 0L
+        var mBytes = 0L
+        var aBytes = 0L
+        var dBytes = 0L
+        var oBytes = 0L
+        var partBytes = 0L
+
+        if (speedDownDir.exists()) {
+            speedDownDir.walkTopDown().forEach { file ->
+                if (file.isFile) {
+                    val len = file.length()
+                    if (file.name.contains(".part")) {
+                        partBytes += len
+                    } else {
+                        when (determineCategory(file.name)) {
+                            "Videos" -> vBytes += len
+                            "Music" -> mBytes += len
+                            "Archives" -> aBytes += len
+                            "Documents" -> dBytes += len
+                            else -> oBytes += len
+                        }
+                    }
+                }
+            }
+        }
+        val total = vBytes + mBytes + aBytes + dBytes + oBytes + partBytes
+        StorageBreakdown(vBytes, mBytes, aBytes, dBytes, oBytes, total, partBytes)
+    }
+
+    suspend fun cleanupOrphanedParts(): Int = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val speedDownDir = File(publicDir, "SpeedDown")
+        var deletedCount = 0
+        val activeIds = store.getActiveDownloads().map { it.filePath }
+        if (speedDownDir.exists()) {
+            speedDownDir.walkTopDown().forEach { file ->
+                if (file.isFile && file.name.contains(".part")) {
+                    val isActive = activeIds.any { file.absolutePath.startsWith(it) }
+                    if (!isActive) {
+                        try {
+                            if (file.delete()) deletedCount++
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        }
+        deletedCount
     }
 
     suspend fun addBatchDownloads(urls: List<String>, threads: Int = 16): Int {
