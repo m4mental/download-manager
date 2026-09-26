@@ -57,8 +57,11 @@ import com.example.speeddown.data.BrowserSettingsStore
 import com.example.speeddown.data.getHomeUrl
 import com.example.speeddown.data.getSearchUrl
 import com.example.speeddown.engine.AdBlockEngine
+import com.example.speeddown.engine.GeckoEngine
+import com.example.speeddown.engine.GeckoTabSession
 import com.example.speeddown.engine.HlsStreamVariant
 import com.example.speeddown.engine.SecureDnsHelper
+import org.mozilla.geckoview.GeckoView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -86,6 +89,7 @@ class BrowserTabItem(
     var canGoForward by mutableStateOf(false)
     var isDesktopMode by mutableStateOf(false)
     var webView: WebView? = null
+    var geckoTabSession: GeckoTabSession? = null
 }
 
 private const val MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
@@ -193,6 +197,10 @@ object BrowserSessionManager {
 
     fun removeTab(context: Context?, tab: BrowserTabItem) {
         val index = tabs.indexOf(tab)
+        try {
+            tab.geckoTabSession?.close()
+        } catch (_: Exception) {}
+        tab.geckoTabSession = null
         tab.webView?.let { wv ->
             (wv.parent as? ViewGroup)?.removeView(wv)
             wv.stopLoading()
@@ -215,6 +223,10 @@ object BrowserSessionManager {
 
     fun clearAll(context: Context?) {
         tabs.forEach { tab ->
+            try {
+                tab.geckoTabSession?.close()
+            } catch (_: Exception) {}
+            tab.geckoTabSession = null
             tab.webView?.let { wv ->
                 (wv.parent as? ViewGroup)?.removeView(wv)
                 wv.stopLoading()
@@ -320,8 +332,8 @@ fun BrowserScreen(
             customFullscreenCallback?.onCustomViewHidden()
             customFullscreenView = null
             customFullscreenCallback = null
-        } else if (currentTab.webView?.canGoBack() == true) {
-            currentTab.webView?.goBack()
+        } else if (currentTab.canGoBack) {
+            currentTab.geckoTabSession?.goBack() ?: currentTab.webView?.goBack()
         } else {
             // Reached beginning of browsing history on this tab: return smoothly to main app, keeping website open in the tab!
             onClose()
@@ -473,7 +485,7 @@ fun BrowserScreen(
                                         }
                                         currentTab.url = target
                                         inputUrl = target
-                                        currentTab.webView?.loadUrl(target)
+                                        currentTab.geckoTabSession?.loadUri(target) ?: currentTab.webView?.loadUrl(target)
                                     }),
                                     modifier = Modifier.weight(1f),
                                     decorationBox = { innerTextField ->
@@ -542,7 +554,39 @@ fun BrowserScreen(
                     }
                 },
                 actions = {
-                    // Actions moved to bottom 3-dot menu so TopAppBar stays completely clean and spacious
+                    IconButton(
+                        onClick = {
+                            blockedCountState = AdBlockEngine.blockedAdsCount
+                            showAdBlockDialog = true
+                        }
+                    ) {
+                        Box(contentAlignment = Alignment.TopEnd) {
+                            Icon(
+                                Icons.Filled.Security,
+                                contentDescription = "uBlock Origin",
+                                tint = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            if (adBlockEnabled) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(15.dp)
+                                        .clip(CircleShape)
+                                        .background(if (blockedCountState > 0) Purple else Green),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = if (blockedCountState > 0) {
+                                            if (blockedCountState > 99) "99+" else "$blockedCountState"
+                                        } else "✓",
+                                        color = Color.White,
+                                        fontSize = 8.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = if (currentTab.isIncognito) Color(0xFF1E1B2E) else MaterialTheme.colorScheme.surface
@@ -565,13 +609,13 @@ fun BrowserScreen(
                     // 1. Back
                     IconButton(
                         onClick = {
-                            if (currentTab.webView?.canGoBack() == true) {
-                                currentTab.webView?.goBack()
+                            if (currentTab.canGoBack) {
+                                currentTab.geckoTabSession?.goBack() ?: currentTab.webView?.goBack()
                             } else if (currentTab.url != "speeddown://home") {
                                 currentTab.url = "speeddown://home"
                                 currentTab.title = "SpeedDown Home"
                                 inputUrl = ""
-                                currentTab.webView?.loadUrl("about:blank")
+                                currentTab.geckoTabSession?.loadUri("about:blank") ?: currentTab.webView?.loadUrl("about:blank")
                             }
                         },
                         enabled = currentTab.canGoBack || (currentTab.url != "speeddown://home" && currentTab.url.isNotBlank()),
@@ -586,7 +630,7 @@ fun BrowserScreen(
 
                     // 2. Forward
                     IconButton(
-                        onClick = { currentTab.webView?.goForward() },
+                        onClick = { currentTab.geckoTabSession?.goForward() ?: currentTab.webView?.goForward() },
                         enabled = currentTab.canGoForward,
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -603,7 +647,7 @@ fun BrowserScreen(
                             currentTab.url = "speeddown://home"
                             currentTab.title = "SpeedDown Home"
                             inputUrl = ""
-                            currentTab.webView?.loadUrl("about:blank")
+                            currentTab.geckoTabSession?.loadUri("about:blank") ?: currentTab.webView?.loadUrl("about:blank")
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -791,7 +835,7 @@ fun BrowserScreen(
                                 },
                                 onClick = {
                                     showMoreMenu = false
-                                    currentTab.webView?.reload()
+                                    currentTab.geckoTabSession?.reload() ?: currentTab.webView?.reload()
                                 }
                             )
 
@@ -821,7 +865,7 @@ fun BrowserScreen(
                                 }
                             )
 
-                            // uBlock Ad Shield
+                            // uBlock Origin Extension
                             DropdownMenuItem(
                                 text = {
                                     Row(
@@ -829,7 +873,14 @@ fun BrowserScreen(
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("uBlock Ad Shield", fontWeight = FontWeight.Medium)
+                                        Column {
+                                            Text("uBlock Origin", fontWeight = FontWeight.Bold)
+                                            Text(
+                                                "Built-in WebExtension",
+                                                fontSize = 11.sp,
+                                                color = if (adBlockEnabled) Green else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                         Spacer(Modifier.width(16.dp))
                                         if (adBlockEnabled && blockedCountState > 0) {
                                             Surface(
@@ -889,6 +940,7 @@ fun BrowserScreen(
                                 onClick = {
                                     showMoreMenu = false
                                     currentTab.isDesktopMode = !currentTab.isDesktopMode
+                                    currentTab.geckoTabSession?.setDesktop(currentTab.isDesktopMode)
                                     currentTab.webView?.settings?.userAgentString = if (currentTab.isDesktopMode) DESKTOP_UA else MOBILE_UA
                                     currentTab.webView?.settings?.useWideViewPort = true
                                     currentTab.webView?.settings?.loadWithOverviewMode = true
@@ -949,7 +1001,7 @@ fun BrowserScreen(
                         }
                         currentTab.url = target
                         inputUrl = target
-                        currentTab.webView?.loadUrl(target)
+                        currentTab.geckoTabSession?.loadUri(target) ?: currentTab.webView?.loadUrl(target)
                     },
                     onOpenSettings = { showBrowserSettings = true },
                     onAddShortcut = { title, url ->
@@ -967,33 +1019,42 @@ fun BrowserScreen(
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                // WebViews Container for multiple tabs
+                // Mozilla GeckoView Engine with built-in uBlock Origin Extension
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
-                        FrameLayout(ctx).apply {
+                        GeckoView(ctx).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
                         }
                     },
-                    update = { container ->
-                        if (currentTab.webView == null) {
-                            currentTab.webView = createTabWebView(
+                    update = { gView ->
+                        if (currentTab.geckoTabSession == null) {
+                            currentTab.geckoTabSession = GeckoTabSession(
                                 context = context,
-                                tab = currentTab,
-                                browserSettings = browserSettings,
-                                detectedMedia = detectedMedia,
+                                isIncognito = currentTab.isIncognito,
+                                isDesktopMode = currentTab.isDesktopMode,
+                                onTitleChanged = { newTitle ->
+                                    currentTab.title = newTitle
+                                },
                                 onUrlChanged = { newUrl ->
+                                    currentTab.url = newUrl
                                     if (currentTab.id == activeTabId) {
                                         inputUrl = newUrl
                                     }
                                 },
-                                onAdBlocked = {
-                                    blockedCountState = AdBlockEngine.blockedAdsCount
+                                onProgressChanged = { progress ->
+                                    currentTab.webProgress = progress
                                 },
-                                onOpenNewTab = { targetUrl ->
+                                onCanGoBackChanged = { canBack ->
+                                    currentTab.canGoBack = canBack
+                                },
+                                onCanGoForwardChanged = { canForward ->
+                                    currentTab.canGoForward = canForward
+                                },
+                                onNewTabRequested = { targetUrl ->
                                     val newTab = BrowserTabItem(
                                         initialUrl = targetUrl,
                                         isIncognito = currentTab.isIncognito
@@ -1005,35 +1066,24 @@ fun BrowserScreen(
                                     inputUrl = targetUrl
                                     Toast.makeText(context, "Opened in new tab", Toast.LENGTH_SHORT).show()
                                 },
-                                onShowCustomView = { v, callback ->
-                                    customFullscreenView = v
-                                    customFullscreenCallback = callback
+                                onMediaSniffed = { mediaUrl ->
+                                    sniffMediaUrl(mediaUrl, detectedMedia)
                                 },
-                                onHideCustomView = {
-                                    customFullscreenCallback?.onCustomViewHidden()
-                                    customFullscreenView = null
-                                    customFullscreenCallback = null
-                                },
-                                onRequestDownloadConfig = { url, fileName, threads ->
+                                onDownloadRequested = { url, fileName, threads ->
                                     pendingDownload = PendingBrowserDownload(url, fileName, threads)
+                                },
+                                onAdBlocked = {
+                                    blockedCountState = AdBlockEngine.blockedAdsCount
                                 }
                             )
+                            if (currentTab.url.startsWith("http://") || currentTab.url.startsWith("https://")) {
+                                currentTab.geckoTabSession?.loadUri(currentTab.url)
+                            }
                         }
 
-                        val activeView = currentTab.webView
-                        if (activeView != null) {
-                            val currentChild = if (container.childCount > 0) container.getChildAt(0) else null
-                            if (currentChild !== activeView) {
-                                container.removeAllViews()
-                                (activeView.parent as? ViewGroup)?.removeView(activeView)
-                                container.addView(
-                                    activeView,
-                                    FrameLayout.LayoutParams(
-                                        FrameLayout.LayoutParams.MATCH_PARENT,
-                                        FrameLayout.LayoutParams.MATCH_PARENT
-                                    )
-                                )
-                            }
+                        val activeSession = currentTab.geckoTabSession?.session
+                        if (activeSession != null && gView.session !== activeSession) {
+                            gView.setSession(activeSession)
                         }
                     }
                 )
@@ -1115,6 +1165,10 @@ fun BrowserScreen(
                             TextButton(
                                 onClick = {
                                     tabs.filter { it.id != activeTabId }.forEach {
+                                        try {
+                                            it.geckoTabSession?.close()
+                                        } catch (_: Exception) {}
+                                        it.geckoTabSession = null
                                         it.webView?.let { wv ->
                                             (wv.parent as? ViewGroup)?.removeView(wv)
                                             wv.stopLoading()
@@ -1179,6 +1233,10 @@ fun BrowserScreen(
                                     )
                                     IconButton(
                                         onClick = {
+                                            try {
+                                                tab.geckoTabSession?.close()
+                                            } catch (_: Exception) {}
+                                            tab.geckoTabSession = null
                                             tab.webView?.let { wv ->
                                                 (wv.parent as? ViewGroup)?.removeView(wv)
                                                 wv.stopLoading()
@@ -1259,7 +1317,25 @@ fun BrowserScreen(
                 }
             },
             title = {
-                Text("uBlock Ad Shield", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("uBlock Origin", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Surface(
+                        color = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green.copy(alpha = 0.15f) else Color.Gray.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text(
+                            text = if (adBlockEnabled && GeckoEngine.isUBlockActive) "BUILT-IN ACTIVE" else if (adBlockEnabled) "INITIALIZING" else "PAUSED",
+                            color = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green else Color.Gray,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
             },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1269,11 +1345,11 @@ fun BrowserScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column {
-                            Text("Block Ads & Popups", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text("Engine Protection", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                             Text(
-                                if (adBlockEnabled) "uBlock Protection Active" else "Protection Paused",
-                                fontSize = 12.sp,
-                                color = if (adBlockEnabled) Green else MaterialTheme.colorScheme.onSurfaceVariant
+                                "Mozilla GeckoView + uBlock Origin v1.75",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Switch(
@@ -1293,20 +1369,59 @@ fun BrowserScreen(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Text("Total Threats & Ads Blocked", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(
-                                "$blockedCountState Blocked",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 22.sp,
-                                color = Green
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text("Ads & Rogue Popups Blocked", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(
+                                        "$blockedCountState Blocked",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 22.sp,
+                                        color = Green
+                                    )
+                                }
+                                if (blockedCountState > 0) {
+                                    TextButton(
+                                        onClick = {
+                                            AdBlockEngine.resetCount()
+                                            blockedCountState = 0
+                                        }
+                                    ) {
+                                        Text("Reset", fontSize = 12.sp, color = Purple)
+                                    }
+                                }
+                            }
                         }
                     }
 
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("🛡️ uBlock Scriptlet Defusers (Defuses window.open & popunders)", fontSize = 12.sp)
-                        Text("🚫 EasyList Domain Filter (Blocks video ads & banners)", fontSize = 12.sp)
-                        Text("⚡ Click-Hijack Shield (Stops redirect on video click)", fontSize = 12.sp)
+                        Text("🛡️ uBlock WebExtension: Active in All Web Frames", fontSize = 12.sp)
+                        Text("🚫 EasyList + EasyPrivacy: Banners & Trackers blocked", fontSize = 12.sp)
+                        Text("🛑 Fake Link & Rogue Redirects: Blocked at engine level", fontSize = 12.sp)
+                        Text("⚡ Multi-Hop Safe: Genuine countdown & downloads flow naturally", fontSize = 12.sp)
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = Green.copy(alpha = 0.08f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = Green, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "Extension: ${GeckoEngine.extensionId ?: "uBlock0@raymondhill.net"}",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
                 }
             },
@@ -2083,34 +2198,7 @@ private fun createTabWebView(
                     return true
                 }
 
-                // 6. External / New Site Link -> OPEN IN NEW TAB!
-                val currentUrl = tab.url
-                val isCurrentWeb = currentUrl.startsWith("http://", ignoreCase = true) || currentUrl.startsWith("https://", ignoreCase = true)
-                if (isCurrentWeb) {
-                    val currentHost = try { Uri.parse(currentUrl).host?.lowercase()?.removePrefix("www.") ?: "" } catch (_: Exception) { "" }
-                    var targetHost = try { Uri.parse(reqUrl).host?.lowercase()?.removePrefix("www.") ?: "" } catch (_: Exception) { "" }
-                    var effectiveTargetUrl = reqUrl
-
-                    // Resolve search engine redirect wrappers (e.g. google.com/url?q=https://...)
-                    if (targetHost.contains("google.") && reqUrl.contains("/url?")) {
-                        val q = Uri.parse(reqUrl).getQueryParameter("q") ?: Uri.parse(reqUrl).getQueryParameter("url")
-                        if (!q.isNullOrBlank() && (q.startsWith("http://") || q.startsWith("https://"))) {
-                            effectiveTargetUrl = q
-                            targetHost = try { Uri.parse(effectiveTargetUrl).host?.lowercase()?.removePrefix("www.") ?: "" } catch (_: Exception) { "" }
-                        }
-                    }
-
-                    val isDifferentHost = currentHost.isNotBlank() && targetHost.isNotBlank() && currentHost != targetHost
-
-                    if (isDifferentHost) {
-                        // Open the external / new site in a NEW TAB so current site tab stays intact!
-                        mainHandler.post {
-                            onOpenNewTab(effectiveTargetUrl)
-                        }
-                        return true
-                    }
-                }
-
+                // Redirects are left alone: Normal page navigations flow naturally!
                 return super.shouldOverrideUrlLoading(view, request)
             }
 
@@ -2139,65 +2227,69 @@ private fun createTabWebView(
                 isUserGesture: Boolean,
                 resultMsg: Message?
             ): Boolean {
-                // 1. Direct hit-test URL check
-                val hitTest = view?.hitTestResult
-                val extraUrl = hitTest?.extra
-
-                if (!extraUrl.isNullOrBlank()) {
-                    if (AdBlockEngine.isAd(extraUrl) || AdBlockEngine.isRogueRedirect(extraUrl)) {
-                        AdBlockEngine.recordBlock()
-                        mainHandler.post { onAdBlocked() }
-                        return false
-                    }
-                    mainHandler.post {
-                        onOpenNewTab(extraUrl)
-                    }
+                // Block unsolicited popups without user gesture
+                if (browserSettings.blockPopups && !isUserGesture) {
+                    AdBlockEngine.recordBlock()
+                    mainHandler.post { onAdBlocked() }
                     return false
                 }
 
-                // 2. Transport message capture for target="_blank" or window.open
-                val transport = resultMsg?.obj as? WebView.WebViewTransport
-                if (transport != null) {
-                    val tempWv = WebView(context).apply {
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
-                                val destUrl = request?.url?.toString() ?: return false
-                                if (AdBlockEngine.isAd(destUrl) || AdBlockEngine.isRogueRedirect(destUrl)) {
-                                    AdBlockEngine.recordBlock()
-                                    mainHandler.post { onAdBlocked() }
-                                    v?.stopLoading()
-                                    v?.destroy()
-                                    return true
-                                }
-                                mainHandler.post {
-                                    onOpenNewTab(destUrl)
-                                }
-                                v?.stopLoading()
-                                v?.destroy()
-                                return true
-                            }
+                // Transport message capture for target="_blank" or window.open
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                val tempWv = WebView(context).apply {
+                    webViewClient = object : WebViewClient() {
+                        private var isHandled = false
 
-                            override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
-                                super.onPageStarted(v, url, favicon)
-                                url?.let { dest ->
-                                    if (dest != "about:blank") {
-                                        if (!AdBlockEngine.isAd(dest) && !AdBlockEngine.isRogueRedirect(dest)) {
-                                            mainHandler.post {
-                                                onOpenNewTab(dest)
-                                            }
-                                        }
-                                        v?.stopLoading()
-                                        v?.destroy()
-                                    }
+                        private fun handleDestination(destUrl: String, v: WebView?) {
+                            if (isHandled) return
+                            isHandled = true
+                            v?.stopLoading()
+                            v?.destroy()
+
+                            // Drop ad popups
+                            if (AdBlockEngine.isAd(destUrl) || AdBlockEngine.isRogueRedirect(destUrl)) {
+                                AdBlockEngine.recordBlock()
+                                mainHandler.post { onAdBlocked() }
+                                return
+                            }
+                            if (isDownloadableFile(destUrl)) {
+                                sniffMediaUrl(destUrl, detectedMedia)
+                                mainHandler.post {
+                                    onRequestDownloadConfig(destUrl, "download_${System.currentTimeMillis()}", 16)
+                                }
+                                return
+                            }
+                            // Legitimate user link opening in a new window/tab
+                            mainHandler.post {
+                                onOpenNewTab(destUrl)
+                            }
+                        }
+
+                        override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
+                            val destUrl = request?.url?.toString() ?: return false
+                            handleDestination(destUrl, v)
+                            return true
+                        }
+
+                        override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
+                            super.onPageStarted(v, url, favicon)
+                            url?.let { dest ->
+                                if (dest != "about:blank") {
+                                    handleDestination(dest, v)
                                 }
                             }
                         }
                     }
-                    transport.webView = tempWv
-                    resultMsg.sendToTarget()
-                    return true
                 }
-                return false
+                mainHandler.postDelayed({
+                    try {
+                        tempWv.stopLoading()
+                        tempWv.destroy()
+                    } catch (_: Exception) {}
+                }, 8000)
+                transport.webView = tempWv
+                resultMsg.sendToTarget()
+                return true
             }
 
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
@@ -2237,7 +2329,12 @@ private fun isDownloadableFile(url: String): Boolean {
             clean.endsWith(".exe") || clean.endsWith(".msi") || clean.endsWith(".deb") || clean.endsWith(".rpm") ||
             clean.endsWith(".torrent") || clean.endsWith(".pdf") || clean.endsWith(".epub") ||
             clean.endsWith(".bin") || clean.endsWith(".doc") || clean.endsWith(".docx") ||
-            clean.endsWith(".xls") || clean.endsWith(".xlsx") || clean.endsWith(".ppt") || clean.endsWith(".pptx")
+            clean.endsWith(".xls") || clean.endsWith(".xlsx") || clean.endsWith(".ppt") || clean.endsWith(".pptx") ||
+            clean.endsWith(".mp4") || clean.endsWith(".mkv") || clean.endsWith(".webm") ||
+            clean.endsWith(".avi") || clean.endsWith(".mov") || clean.endsWith(".m4v") ||
+            clean.endsWith(".flv") || clean.endsWith(".3gp") || clean.endsWith(".wmv") ||
+            clean.endsWith(".mp3") || clean.endsWith(".m4a") || clean.endsWith(".aac") ||
+            clean.endsWith(".flac") || clean.endsWith(".wav") || clean.endsWith(".ogg")
 }
 
 private fun isDirectDownloadUrl(url: String): Boolean {

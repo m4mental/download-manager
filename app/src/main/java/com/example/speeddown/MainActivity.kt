@@ -52,6 +52,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Initialize AdBlockEngine and pre-warm Mozilla GeckoView & built-in uBlock Origin engine
+        com.example.speeddown.engine.AdBlockEngine.init(applicationContext)
+        com.example.speeddown.engine.GeckoEngine.getOrCreateRuntime(applicationContext)
+
         handleIntent(intent)
 
         setContent {

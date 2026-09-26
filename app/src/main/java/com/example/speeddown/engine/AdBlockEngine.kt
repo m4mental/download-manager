@@ -49,14 +49,24 @@ object AdBlockEngine {
         domainSet.addAll(FALLBACK_AD_DOMAINS)
     }
 
-    // High-frequency substring heuristics that identify popunders, redirect farms, and trackers
+    // High-frequency substring heuristics that identify popunders, redirect farms, fake download traps, and trackers
     private val AD_URL_PATTERNS = listOf(
         "popunder", "pop-under", "popads", "popcash", "adsterra", "monetag",
         "hilltopads", "galaksion", "onclickalgo", "onclickperf", "onclickmega",
+        "onclickclean", "onclickpredictiv", "onclickperformance",
         "clickadu", "adcash", "ad-maven", "zeroredirect", "adskeeper", "adsupply",
         "bidvertiser", "ero-ad", "wpadm", "trafficjunky", "trafficfactory",
         "deloplen", "exosrv", "tsyndicate", "realsrv", "juicyads", "adtrue",
         "histats", "stripchat", "chaturbate", "bongacams", "livejasmin",
+        "cam4.com", "camsoda.com", "jerkmate.com", "streamate.com",
+        "1xbet", "1x-bet", "1win", "bet365", "melbet", "parimatch", "mostbet",
+        "betwinner", "dafabet", "linebet", "pin-up.bet", "pin-up.casino",
+        "stake.com", "stake.bet", "betano", "megapari",
+        "propellerads", "propellerclick", "propush", "richads", "richpush",
+        "rollerads", "revenuehits", "popmyads", "yllix", "evadav",
+        "adbull", "adcombo", "adplxmd", "syndication.exoclick",
+        "syndication.realsrv", "syndication.optimatic",
+        "virus-detected", "device-infected", "clean-phone", "phone-cleaner",
         "/ads.js", "/ad.js", "/adframe", "/banner_ad", "adserver", "ads_click",
         "doubleclick.net", "googleadservices.com", "googlesyndication.com"
     )
@@ -96,17 +106,33 @@ object AdBlockEngine {
     }
 
     /**
-     * Checks if a URL scheme or redirect is rogue (e.g. hijack intents, spam app store triggers)
+     * Checks if a URL scheme or redirect is rogue (e.g. hijack intents, spam app store triggers, fake virus traps)
      */
     fun isRogueRedirect(url: String): Boolean {
         if (!isEnabled || url.isBlank()) return false
         val lower = url.lowercase().trim()
 
-        // Block rogue intents, app store links, and messenger triggers from download pages
+        // 1. Block rogue intents, app store links, and messenger triggers from download pages
         if (lower.startsWith("intent://") ||
             lower.startsWith("market://") ||
             lower.startsWith("whatsapp://") ||
-            lower.startsWith("tg://")
+            lower.startsWith("tg://") ||
+            lower.startsWith("viber://") ||
+            lower.startsWith("line://") ||
+            lower.startsWith("tel:") ||
+            lower.startsWith("sms:")
+        ) {
+            return true
+        }
+
+        // 2. Block scam / scareware alerts & fake security warnings
+        if (lower.contains("virus-detected") ||
+            lower.contains("device-infected") ||
+            lower.contains("threat-detected") ||
+            lower.contains("critical-warning") ||
+            lower.contains("clean-phone") ||
+            lower.contains("phone-cleaner") ||
+            lower.contains("system-alert-security")
         ) {
             return true
         }
@@ -139,7 +165,7 @@ object AdBlockEngine {
                 if (window.__uBlockDefusersActive) return;
                 window.__uBlockDefusersActive = true;
 
-                // 1. Defuse window.open (uBO nowinopen)
+                // 1. Defuse window.open for ad popups
                 var dummyWindow = {
                     closed: true,
                     focus: function() {},
@@ -147,21 +173,20 @@ object AdBlockEngine {
                     close: function() {},
                     postMessage: function() {}
                 };
-                var noopOpen = function(u) {
-                    console.log('uBlock Origin Defuser: Blocked window.open:', u);
-                    if (window.SpeedDownAdBlock) window.SpeedDownAdBlock.notifyAdBlocked();
+                var origOpen = window.open;
+                window.open = function(url, target, features) {
+                    if (url && typeof url === 'string') {
+                        if (window.SpeedDownAdBlock && window.SpeedDownAdBlock.isAdUrl(url)) {
+                            console.log('uBlock Defuser: Blocked ad window.open:', url);
+                            window.SpeedDownAdBlock.notifyAdBlocked();
+                            return dummyWindow;
+                        }
+                    }
+                    if (origOpen) {
+                        return origOpen.apply(this, arguments);
+                    }
                     return dummyWindow;
                 };
-
-                try {
-                    Object.defineProperty(window, 'open', {
-                        get: function() { return noopOpen; },
-                        set: function() {},
-                        configurable: false
-                    });
-                } catch(e) {
-                    window.open = noopOpen;
-                }
 
                 // 2. Defuse synthetic element clicks on links (common popup trigger)
                 var origClick = HTMLElement.prototype.click;
@@ -179,7 +204,7 @@ object AdBlockEngine {
 
                 // 3. Defuse Alert / Confirm / Prompt traps that lock the browser
                 window.alert = function() {};
-                window.confirm = function() { return false; };
+                window.confirm = function() { return true; };
                 window.prompt = function() { return null; };
                 window.blur = function() {};
 
@@ -234,9 +259,15 @@ object AdBlockEngine {
         "juicyads.com", "adtrue.com", "histats.com", "deloplen.com",
         "trafficjunky.com", "trafficfactory.biz", "hilltopads.com",
         "monetag.com", "galaksion.com", "onclickalgo.com", "onclickperformance.com",
-        "onclickmega.com", "yllix.com", "clickadu.com", "adcash.com",
+        "onclickmega.com", "onclickclean.com", "onclickpredictiv.com",
+        "yllix.com", "clickadu.com", "adcash.com", "propush.me", "propellerclick.com",
         "ad-maven.com", "zeroredirect1.com", "adskeeper.co.uk", "adskeeper.com",
         "stripchat.com", "chaturbate.com", "bongacams.com", "livejasmin.com",
-        "1xbet.com", "bet365.com", "shorte.st", "ouo.io", "linkvertise.com"
+        "jerkmate.com", "streamate.com", "cam4.com", "camsoda.com",
+        "1xbet.com", "bet365.com", "1win.pro", "1win.com", "melbet.com",
+        "parimatch.com", "mostbet.com", "betwinner.com", "dafabet.com",
+        "linebet.com", "pin-up.bet", "pin-up.casino", "stake.com",
+        "richads.com", "richpush.co", "rollerads.com", "revenuehits.com",
+        "popmyads.com", "evadav.com", "adbull.me", "adcombo.com", "adplxmd.com"
     )
 }

@@ -7,8 +7,6 @@ adbull.me
 adcash.com
 adcolony.com
 adcombo.com
-adf.ly
-adfly.com
 adform.net
 adkernel.com
 admob.com
@@ -26,7 +24,6 @@ adxpansion.com
 adxprt.com
 applovin.com
 appsflyer.com
-bc.vc
 bet365.com
 betwinner.com
 bidswitch.net
@@ -41,7 +38,6 @@ chaturbate.com
 clickadu.com
 clickdealer.com
 clickfuse.com
-clk.sh
 coinad.com
 cpmstar.com
 criteo.com
@@ -53,7 +49,6 @@ doubleclick.net
 engine.phn.doublepimp.com
 ero-advertising.com
 evadav.com
-exe.io
 exoclick.com
 exosrv.com
 flirt4free.com
@@ -73,8 +68,6 @@ ironsrc.com
 jerkmate.com
 juicyads.com
 linebet.com
-linkvertise.com
-linkvertise.net
 livejasmin.com
 main.exoclick.com
 melbet.com
@@ -89,8 +82,6 @@ onclickmega.com
 onclickperformance.com
 onclickpredictiv.com
 openx.net
-ouo.io
-ouo.press
 outbrain.com
 pagead2.googlesyndication.com
 parimatch.com
@@ -113,9 +104,6 @@ rollerads.com
 rubiconproject.com
 scorecardresearch.com
 serving-sys.com
-shorte.st
-shrinkearn.com
-shrinkme.io
 smartadserver.com
 streamate.com
 stripchat.com
@@ -135,5 +123,4 @@ wpadm.com
 wpe.nu
 yieldmo.com
 yllix.com
-za.gl
 zeroredirect1.com

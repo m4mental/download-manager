@@ -13,6 +13,9 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     signingConfigs {
@@ -53,6 +56,10 @@ android {
       aidl = false
       buildConfig = true
       shaders = false
+    }
+
+    androidResources {
+        ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~"
     }
 
     packaging {
@@ -124,4 +131,7 @@ dependencies {
 
   // Coroutines
   implementation(libs.kotlinx.coroutines.android)
+
+  // Mozilla GeckoView Engine
+  implementation("org.mozilla.geckoview:geckoview-omni:130.0.20240913135723")
 }
