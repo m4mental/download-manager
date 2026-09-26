@@ -48,14 +48,17 @@ class BrowserSettingsStore private constructor(private val context: Context) {
         }
 
         val DEFAULT_SHORTCUTS = listOf(
+            BrowserShortcut(title = "FMHY", url = "https://github.com/fmhy/FMHY", badge = "FM", iconColorHex = "#6366F1"),
             BrowserShortcut(title = "Google", url = "https://www.google.com", badge = "G", iconColorHex = "#4285F4"),
             BrowserShortcut(title = "YouTube", url = "https://www.youtube.com", badge = "YT", iconColorHex = "#EF4444"),
+            BrowserShortcut(title = "VegaMovies", url = "https://vegamovies.gallery", badge = "VM", iconColorHex = "#10B981"),
+            BrowserShortcut(title = "JavGuru", url = "https://jav.guru", badge = "JG", iconColorHex = "#EC4899"),
+            BrowserShortcut(title = "1337x", url = "https://1337x.to", badge = "13", iconColorHex = "#DC2626"),
+            BrowserShortcut(title = "YTS", url = "https://yts.mx", badge = "YTS", iconColorHex = "#16A34A"),
             BrowserShortcut(title = "Reddit", url = "https://www.reddit.com", badge = "R", iconColorHex = "#F97316"),
             BrowserShortcut(title = "Wikipedia", url = "https://www.wikipedia.org", badge = "W", iconColorHex = "#64748B"),
             BrowserShortcut(title = "GitHub", url = "https://github.com", badge = "GH", iconColorHex = "#8B5CF6"),
-            BrowserShortcut(title = "Archive.org", url = "https://archive.org", badge = "IA", iconColorHex = "#0284C7"),
-            BrowserShortcut(title = "1337x", url = "https://1337x.to", badge = "13", iconColorHex = "#DC2626"),
-            BrowserShortcut(title = "YTS", url = "https://yts.mx", badge = "YTS", iconColorHex = "#16A34A")
+            BrowserShortcut(title = "Archive.org", url = "https://archive.org", badge = "IA", iconColorHex = "#0284C7")
         )
     }
 
@@ -98,7 +101,15 @@ class BrowserSettingsStore private constructor(private val context: Context) {
             DEFAULT_SHORTCUTS
         } else {
             try {
-                json.decodeFromString<List<BrowserShortcut>>(raw)
+                val decoded = json.decodeFromString<List<BrowserShortcut>>(raw)
+                val missingDefaults = DEFAULT_SHORTCUTS.filter { def ->
+                    decoded.none { it.url.equals(def.url, ignoreCase = true) || it.title.equals(def.title, ignoreCase = true) }
+                }
+                if (missingDefaults.isNotEmpty()) {
+                    missingDefaults + decoded
+                } else {
+                    decoded
+                }
             } catch (_: Exception) {
                 DEFAULT_SHORTCUTS
             }

@@ -2,6 +2,7 @@ package com.example.speeddown.ui.browser
 
 import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
@@ -26,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -35,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.speeddown.data.BrowserSettings
 import com.example.speeddown.data.BrowserShortcut
+import com.example.speeddown.data.FaviconLoader
 import com.example.speeddown.data.getSearchUrl
 import com.example.speeddown.engine.AdBlockEngine
 
@@ -403,6 +406,12 @@ private fun ShortcutItemView(
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var faviconBitmap by remember(shortcut.url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(shortcut.url) {
+        faviconBitmap = FaviconLoader.getFavicon(context, shortcut.url)
+    }
+
     val parsedColor = try {
         Color(android.graphics.Color.parseColor(shortcut.iconColorHex))
     } catch (_: Exception) {
@@ -420,16 +429,35 @@ private fun ShortcutItemView(
             modifier = Modifier
                 .size(54.dp)
                 .clip(CircleShape)
-                .background(parsedColor.copy(alpha = 0.15f))
-                .border(1.dp, parsedColor.copy(alpha = 0.4f), CircleShape),
+                .background(
+                    if (faviconBitmap != null) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                    else parsedColor.copy(alpha = 0.15f)
+                )
+                .border(
+                    1.dp,
+                    if (faviconBitmap != null) MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                    else parsedColor.copy(alpha = 0.4f),
+                    CircleShape
+                ),
             contentAlignment = Alignment.Center
         ) {
-            Text(
-                text = shortcut.badge.ifEmpty { shortcut.title.take(2).uppercase() },
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp,
-                color = parsedColor
-            )
+            val bmp = faviconBitmap
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp.asImageBitmap(),
+                    contentDescription = shortcut.title,
+                    modifier = Modifier
+                        .size(30.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                )
+            } else {
+                Text(
+                    text = shortcut.badge.ifEmpty { shortcut.title.take(2).uppercase() },
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    color = parsedColor
+                )
+            }
         }
 
         Spacer(Modifier.height(6.dp))

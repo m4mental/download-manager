@@ -256,7 +256,7 @@ object BrowserSessionManager {
 data class PendingBrowserDownload(
     val url: String,
     val initialFileName: String,
-    val initialThreads: Int = 16
+    val initialThreads: Int = 32
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -264,6 +264,7 @@ data class PendingBrowserDownload(
 @Composable
 fun BrowserScreen(
     initialUrl: String = "speeddown://home",
+    defaultThreads: Int = 32,
     onClose: () -> Unit,
     onNavigateToDownloads: () -> Unit = onClose,
     onStartDownload: (url: String, fileName: String, threads: Int) -> Unit
@@ -1109,8 +1110,10 @@ fun BrowserScreen(
                                     sniffMediaUrl(mediaUrl, detectedMedia)
                                 },
                                 onDownloadRequested = { url, fileName, threads ->
-                                    pendingDownload = PendingBrowserDownload(url, fileName, threads)
+                                    val finalThreads = if (threads > 0) threads else defaultThreads
+                                    pendingDownload = PendingBrowserDownload(url, fileName, finalThreads)
                                 },
+                                defaultThreads = defaultThreads,
                                 onAdBlocked = {
                                     blockedCountState = AdBlockEngine.blockedAdsCount
                                 },
@@ -1780,13 +1783,13 @@ fun BrowserScreen(
                                                             hlsTargetMedia = media
                                                         } else {
                                                             showSnifferSheet = false
-                                                            pendingDownload = PendingBrowserDownload(media.url, media.fileName, 32)
+                                                            pendingDownload = PendingBrowserDownload(media.url, media.fileName, defaultThreads)
                                                         }
                                                     }
                                                 }
                                             } else {
                                                 showSnifferSheet = false
-                                                pendingDownload = PendingBrowserDownload(media.url, media.fileName, 32)
+                                                pendingDownload = PendingBrowserDownload(media.url, media.fileName, defaultThreads)
                                             }
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = Purple),
@@ -1855,7 +1858,7 @@ fun BrowserScreen(
                         val name = pMedia.fileName
                         previewMedia = null
                         showSnifferSheet = false
-                        pendingDownload = PendingBrowserDownload(url, name, 32)
+                        pendingDownload = PendingBrowserDownload(url, name, defaultThreads)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Purple)
                 ) {
@@ -1914,7 +1917,7 @@ fun BrowserScreen(
                                         if (target != null) {
                                             val cleanName = target.fileName.substringBeforeLast(".")
                                             val qualitySuffix = variant.label.replace(" ", "_")
-                                            pendingDownload = PendingBrowserDownload(variant.url, "${cleanName}_$qualitySuffix.mp4", 32)
+                                            pendingDownload = PendingBrowserDownload(variant.url, "${cleanName}_$qualitySuffix.mp4", defaultThreads)
                                         }
                                     }
                             ) {
@@ -1952,7 +1955,7 @@ fun BrowserScreen(
                     hlsTargetMedia = null
                     showSnifferSheet = false
                     if (target != null) {
-                        onStartDownload(target.url, target.fileName, 32)
+                        onStartDownload(target.url, target.fileName, defaultThreads)
                     }
                 }) {
                     Text("Auto / Best Quality")
@@ -2431,7 +2434,7 @@ private fun sniffMediaUrl(url: String, list: MutableList<SniffedMedia>) {
 fun BrowserDownloadConfigDialog(
     url: String,
     initialFileName: String,
-    defaultThreads: Int = 16,
+    defaultThreads: Int = 32,
     onDismiss: () -> Unit,
     onConfirm: (fileName: String, threads: Int) -> Unit
 ) {

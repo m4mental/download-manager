@@ -61,6 +61,9 @@ enum class DownloadTab(val title: String) {
 @Composable
 fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val downloads by viewModel.downloads.collectAsState()
+    val settings by viewModel.settings.collectAsState()
+    val incomingShareUrl by viewModel.incomingShareUrl.collectAsState()
     var showBrowser by rememberSaveable { mutableStateOf(false) }
     var navigatedFromBrowser by rememberSaveable { mutableStateOf(false) }
     var showSettingsScreen by rememberSaveable { mutableStateOf(false) }
@@ -74,6 +77,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     if (showBrowser) {
         BrowserScreen(
             initialUrl = "speeddown://home",
+            defaultThreads = settings.defaultThreads,
             onClose = {
                 showBrowser = false
                 navigatedFromBrowser = false
@@ -98,9 +102,6 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
         return
     }
 
-    val downloads by viewModel.downloads.collectAsState()
-    val settings by viewModel.settings.collectAsState()
-    val incomingShareUrl by viewModel.incomingShareUrl.collectAsState()
     val coroutineScope = rememberCoroutineScope()
     val tabs = remember { DownloadTab.values() }
     val pagerState = rememberPagerState(
@@ -243,14 +244,11 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                         IconButton(onClick = { showStorageDialog = true }) {
                             Icon(Icons.Filled.PieChart, "Storage Organizer", tint = Blue)
                         }
-                        IconButton(onClick = { viewModel.clearCompleted() }) {
-                            Icon(Icons.Filled.CleaningServices, "Clear completed")
-                        }
                         IconButton(onClick = { showSettingsScreen = true }) {
                             Icon(Icons.Filled.Settings, "Settings")
                         }
 
-                        // More Options (Batch Import / Export / Select All)
+                        // More Options (Batch Import / Export / Cleaner / Select All)
                         Box {
                             IconButton(onClick = { showTopMenu = true }) {
                                 Icon(Icons.Filled.MoreVert, "More Options")
@@ -259,6 +257,16 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                                 expanded = showTopMenu,
                                 onDismissRequest = { showTopMenu = false }
                             ) {
+                                DropdownMenuItem(
+                                    text = { Text("Clear Completed") },
+                                    leadingIcon = { Icon(Icons.Filled.CleaningServices, null, tint = Green) },
+                                    onClick = {
+                                        showTopMenu = false
+                                        viewModel.clearCompleted()
+                                        Toast.makeText(context, "Cleared completed downloads", Toast.LENGTH_SHORT).show()
+                                    }
+                                )
+                                HorizontalDivider()
                                 DropdownMenuItem(
                                     text = { Text("Batch Import Links") },
                                     leadingIcon = { Icon(Icons.Filled.PlaylistAdd, null, tint = Purple) },

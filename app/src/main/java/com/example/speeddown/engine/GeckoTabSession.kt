@@ -21,6 +21,7 @@ class GeckoTabSession(
     private val onNewTabRequested: (String) -> Unit,
     private val onMediaSniffed: (String) -> Unit,
     private val onDownloadRequested: (url: String, fileName: String, threads: Int) -> Unit,
+    val defaultThreads: Int = 32,
     private val onAdBlocked: () -> Unit = {},
     private val onFullScreenChanged: (Boolean) -> Unit = {}
 ) {
@@ -56,7 +57,7 @@ class GeckoTabSession(
                 // If downloadable file opened in popup, trigger download
                 if (isDownloadableExtension(targetUri)) {
                     val guessed = targetUri.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                    onDownloadRequested(targetUri, guessed.ifBlank { "download_${System.currentTimeMillis()}" }, 16)
+                    onDownloadRequested(targetUri, guessed.ifBlank { "download_${System.currentTimeMillis()}" }, defaultThreads)
                     return GeckoResult.fromValue(prompt.confirm(AllowOrDeny.DENY))
                 }
 
@@ -136,7 +137,7 @@ class GeckoTabSession(
                 // Check if target is a downloadable file
                 if (isDownloadableExtension(targetUrl)) {
                     val guessed = targetUrl.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                    onDownloadRequested(targetUrl, guessed.ifBlank { "download_${System.currentTimeMillis()}" }, 16)
+                    onDownloadRequested(targetUrl, guessed.ifBlank { "download_${System.currentTimeMillis()}" }, defaultThreads)
                     return GeckoResult.fromValue(AllowOrDeny.DENY)
                 }
 
@@ -194,7 +195,7 @@ class GeckoTabSession(
                     downloadUrl.substringAfterLast("/").substringBefore("?").substringBefore("#")
                 }
                 val fileName = if (guessed.isNotBlank()) guessed else "download_${System.currentTimeMillis()}"
-                onDownloadRequested(downloadUrl, fileName, 16)
+                onDownloadRequested(downloadUrl, fileName, defaultThreads)
             }
         }
 
