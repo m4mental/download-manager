@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.speeddown.data.db.DownloadDatabaseHelper
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -11,10 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "downloads_store")
@@ -45,6 +43,8 @@ class DownloadStore private constructor(private val context: Context) {
     }
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private val dbHelper = DownloadDatabaseHelper.getInstance(context)
+
     private val DOWNLOADS_KEY = stringPreferencesKey("downloads_list")
     private val MAX_CONCURRENT_KEY = intPreferencesKey("settings_max_concurrent")
     private val WIFI_ONLY_KEY = booleanPreferencesKey("settings_wifi_only")
@@ -94,23 +94,40 @@ class DownloadStore private constructor(private val context: Context) {
             prefs[DEFAULT_THREADS_KEY] = newSettings.defaultThreads
         }
     }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val saveMutex = Mutex()
     private val isLoaded = CompletableDeferred<Unit>()
 
     private val _downloadsState = MutableStateFlow<List<DownloadItem>>(emptyList())
     val allDownloads: Flow<List<DownloadItem>> = _downloadsState.asStateFlow()
 
-    private var lastDiskSaveTime = 0L
-
     init {
         scope.launch {
             try {
-                val prefs = context.dataStore.data.first()
-                val raw = prefs[DOWNLOADS_KEY] ?: "[]"
-                val list: List<DownloadItem> = json.decodeFromString(raw)
-                _downloadsState.value = list
-            } catch (_: Exception) {
+                // 1. Load from high-performance SQLite Database
+                var items = dbHelper.getAllDownloads()
+
+                // 2. Backward compatibility: auto-migrate from legacy DataStore if SQLite is empty
+                if (items.isEmpty()) {
+                    val prefs = context.dataStore.data.first()
+                    val raw = prefs[DOWNLOADS_KEY] ?: "[]"
+                    if (raw.isNotBlank() && raw != "[]") {
+                        val legacyList: List<DownloadItem> = runCatching {
+                            json.decodeFromString<List<DownloadItem>>(raw)
+                        }.getOrDefault(emptyList())
+
+                        if (legacyList.isNotEmpty()) {
+                            for (legItem in legacyList) {
+                                dbHelper.upsertDownload(legItem)
+                            }
+                            items = legacyList
+                            // Purge legacy JSON blob from DataStore preferences to save space
+                            context.dataStore.edit { it.remove(DOWNLOADS_KEY) }
+                        }
+                    }
+                }
+                _downloadsState.value = items
+            } catch (e: Exception) {
                 _downloadsState.value = emptyList()
             } finally {
                 isLoaded.complete(Unit)
@@ -131,7 +148,7 @@ class DownloadStore private constructor(private val context: Context) {
 
     suspend fun getById(id: Long): DownloadItem? {
         ensureLoaded()
-        return _downloadsState.value.firstOrNull { it.id == id }
+        return _downloadsState.value.firstOrNull { it.id == id } ?: dbHelper.getDownloadById(id)
     }
 
     fun getActiveDownloads(): List<DownloadItem> {
@@ -146,7 +163,7 @@ class DownloadStore private constructor(private val context: Context) {
             if (idx >= 0) list[idx] = item else list.add(0, item)
             list
         }
-        persistToDisk()
+        scope.launch { dbHelper.upsertDownload(item) }
     }
 
     suspend fun remove(id: Long) {
@@ -154,7 +171,7 @@ class DownloadStore private constructor(private val context: Context) {
         _downloadsState.update { current ->
             current.filterNot { it.id == id }
         }
-        persistToDisk()
+        scope.launch { dbHelper.deleteDownload(id) }
     }
 
     suspend fun clearByStatus(status: DownloadStatus) {
@@ -162,7 +179,7 @@ class DownloadStore private constructor(private val context: Context) {
         _downloadsState.update { current ->
             current.filterNot { it.status == status }
         }
-        persistToDisk()
+        scope.launch { dbHelper.clearByStatus(status) }
     }
 
     suspend fun updateStatus(id: Long, status: DownloadStatus) {
@@ -172,7 +189,7 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(status = status, speed = 0L) else it
             }
         }
-        persistToDisk()
+        scope.launch { dbHelper.updateStatus(id, status) }
     }
 
     suspend fun updateProgress(
@@ -190,7 +207,6 @@ class DownloadStore private constructor(private val context: Context) {
                         it.status == DownloadStatus.COMPLETED ||
                         it.status == DownloadStatus.FAILED
                     ) {
-                        // Never allow late in-flight progress callbacks to overwrite paused or terminal status!
                         it.copy(downloadedSize = downloaded, speed = 0L)
                     } else {
                         it.copy(
@@ -204,11 +220,9 @@ class DownloadStore private constructor(private val context: Context) {
             }
         }
 
-        // Throttle disk write for progress to avoid I/O bottlenecks
-        val now = System.currentTimeMillis()
-        if (now - lastDiskSaveTime > 2500L) {
-            lastDiskSaveTime = now
-            scope.launch { persistToDisk() }
+        // Direct atomic update to SQLite row without JSON serialization
+        scope.launch {
+            dbHelper.updateProgress(id, downloaded, speed, status, partProgress)
         }
     }
 
@@ -219,7 +233,7 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(totalSize = totalSize) else it
             }
         }
-        persistToDisk()
+        scope.launch { dbHelper.updateTotalSize(id, totalSize) }
     }
 
     suspend fun updateError(id: Long, status: DownloadStatus, error: String) {
@@ -229,7 +243,7 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(status = status, errorMessage = error, speed = 0L) else it
             }
         }
-        persistToDisk()
+        scope.launch { dbHelper.updateError(id, status, error) }
     }
 
     suspend fun markCompleted(id: Long) {
@@ -243,7 +257,7 @@ class DownloadStore private constructor(private val context: Context) {
                 ) else it
             }
         }
-        persistToDisk()
+        scope.launch { dbHelper.markCompleted(id) }
     }
 
     suspend fun updateUrl(id: Long, newUrl: String) {
@@ -257,7 +271,7 @@ class DownloadStore private constructor(private val context: Context) {
                 ) else it
             }
         }
-        persistToDisk()
+        scope.launch { dbHelper.updateUrl(id, newUrl) }
     }
 
     suspend fun updateTorrentStats(id: Long, peers: Int, seeds: Int) {
@@ -267,19 +281,6 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(torrentPeers = peers, torrentSeeds = seeds) else it
             }
         }
-    }
-
-    private suspend fun persistToDisk() {
-        saveMutex.withLock {
-            try {
-                val list = _downloadsState.value
-                val raw = json.encodeToString(list)
-                context.dataStore.edit { prefs ->
-                    prefs[DOWNLOADS_KEY] = raw
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
+        scope.launch { dbHelper.updateTorrentStats(id, peers, seeds) }
     }
 }

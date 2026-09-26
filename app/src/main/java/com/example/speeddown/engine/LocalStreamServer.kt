@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Embedded ultra-lightweight progressive HTTP stream server for Nothing Player integration.
  * Allows Nothing Player (or any media player) to stream audio/video files progressively
- * while SpeedDown is still downloading them in the background.
+ * across multi-part download chunks while SpeedDown is still downloading them in the background.
  */
 class LocalStreamServer private constructor(
     private val store: DownloadStore
@@ -140,6 +140,37 @@ class LocalStreamServer private constructor(
         }
     }
 
+    private data class FileResolution(val file: File?, val offsetInFile: Long, val maxLimitInPart: Long)
+
+    private fun resolveVirtualFile(
+        basePath: String,
+        offset: Long,
+        chunkSize: Long,
+        threadCount: Int,
+        totalSize: Long
+    ): FileResolution {
+        val target = File(basePath)
+        if (target.exists() && target.length() > 0) {
+            return FileResolution(target, offset, totalSize)
+        }
+        val singlePart = File("$basePath.part")
+        if (singlePart.exists() && singlePart.length() > 0) {
+            return FileResolution(singlePart, offset, totalSize)
+        }
+
+        if (chunkSize > 0 && threadCount > 1) {
+            val partIdx = (offset / chunkSize).toInt().coerceIn(0, threadCount - 1)
+            val partStart = partIdx * chunkSize
+            val offsetInPart = offset - partStart
+            val maxLimit = if (partIdx == threadCount - 1) (totalSize - partStart) else chunkSize
+            val partFile = File("$basePath.part$partIdx")
+            return FileResolution(partFile, offsetInPart, maxLimit)
+        }
+
+        val part0 = File("$basePath.part0")
+        return FileResolution(if (part0.exists()) part0 else null, offset, totalSize)
+    }
+
     private suspend fun serveMedia(
         client: Socket,
         output: OutputStream,
@@ -147,23 +178,29 @@ class LocalStreamServer private constructor(
         rangeHeader: String?
     ) {
         val targetFile = File(item.filePath)
+        val singlePart = File(item.filePath + ".part")
         val part0 = File(item.filePath + ".part0")
 
-        // Source file for streaming: completed file, or part0 (progressive beginning)
-        val sourceFile = when {
-            targetFile.exists() && targetFile.length() > 0 -> targetFile
-            part0.exists() && part0.length() > 0 -> part0
-            else -> null
-        }
+        val hasData = (targetFile.exists() && targetFile.length() > 0) ||
+                      (singlePart.exists() && singlePart.length() > 0) ||
+                      (part0.exists() && part0.length() > 0)
 
-        if (sourceFile == null) {
+        if (!hasData) {
             sendError(output, 404, "No streamable data ready yet")
             return
         }
 
-        val totalSize = if (item.totalSize > 0) item.totalSize else sourceFile.length()
-        val mimeType = getMimeType(item.fileName)
+        val totalSize = if (item.totalSize > 0) {
+            item.totalSize
+        } else if (targetFile.exists()) {
+            targetFile.length()
+        } else if (singlePart.exists()) {
+            singlePart.length()
+        } else {
+            part0.length()
+        }
 
+        val mimeType = getMimeType(item.fileName)
         var startByte = 0L
         var endByte = totalSize - 1
 
@@ -197,52 +234,71 @@ class LocalStreamServer private constructor(
         output.write(responseHeader.toByteArray(Charsets.UTF_8))
         output.flush()
 
-        // Stream data bytes with live polling if player catches up to downloader
+        // Stream data bytes with multi-part virtual file resolution and live polling
         val buffer = ByteArray(64 * 1024)
         var currentOffset = startByte
-        val raf = RandomAccessFile(sourceFile, "r")
+        val threadCount = item.threads.coerceAtLeast(1)
+        val chunkSize = if (threadCount > 1 && totalSize > 0) totalSize / threadCount else 0L
 
         try {
-            raf.seek(currentOffset)
-
             while (currentOffset <= endByte && !client.isClosed) {
-                val fileLen = sourceFile.length()
-                if (currentOffset >= fileLen) {
-                    // Check if download is still running; wait up to 10 seconds for new bytes
+                val res = resolveVirtualFile(item.filePath, currentOffset, chunkSize, threadCount, totalSize)
+                val activeFile = res.file
+                val targetOffset = res.offsetInFile
+                val partLimit = res.maxLimitInPart
+
+                if (activeFile == null || !activeFile.exists()) {
+                    // Wait up to 3 seconds for downloader to create part
                     var waited = 0
-                    var hasMore = false
-                    while (waited < 100 && !client.isClosed) {
+                    while (waited < 30 && !client.isClosed) {
                         delay(100)
                         waited++
-                        if (sourceFile.length() > currentOffset) {
-                            hasMore = true
+                        val check = resolveVirtualFile(item.filePath, currentOffset, chunkSize, threadCount, totalSize).file
+                        if (check != null && check.exists() && check.length() > targetOffset) {
                             break
                         }
                     }
-                    if (!hasMore) {
-                        // Reached current EOF and no new data
+                }
+
+                val currentFile = resolveVirtualFile(item.filePath, currentOffset, chunkSize, threadCount, totalSize).file
+                if (currentFile == null || !currentFile.exists()) {
+                    break
+                }
+
+                // If downloader hasn't written bytes up to targetOffset yet, poll briefly
+                if (currentFile.length() <= targetOffset) {
+                    var waited = 0
+                    while (waited < 40 && !client.isClosed && currentFile.length() <= targetOffset) {
+                        delay(100)
+                        waited++
+                    }
+                    if (currentFile.length() <= targetOffset) {
                         break
                     }
                 }
 
-                val availableNow = (sourceFile.length() - currentOffset).coerceAtLeast(0L)
-                val toRead = minOf(buffer.size.toLong(), availableNow, endByte - currentOffset + 1).toInt()
-                if (toRead <= 0) break
+                val availableNow = (currentFile.length() - targetOffset).coerceAtLeast(0L)
+                val remainingInPart = if (partLimit > 0) (partLimit - targetOffset).coerceAtLeast(0L) else availableNow
+                val bytesToRead = minOf(buffer.size.toLong(), availableNow, remainingInPart, endByte - currentOffset + 1).toInt()
 
-                raf.seek(currentOffset)
-                val read = raf.read(buffer, 0, toRead)
-                if (read <= 0) break
+                if (bytesToRead <= 0) {
+                    break
+                }
 
-                output.write(buffer, 0, read)
-                currentOffset += read
+                RandomAccessFile(currentFile, "r").use { raf ->
+                    raf.seek(targetOffset)
+                    val read = raf.read(buffer, 0, bytesToRead)
+                    if (read > 0) {
+                        output.write(buffer, 0, read)
+                        currentOffset += read
+                    }
+                }
             }
             output.flush()
         } catch (_: SocketException) {
-            // Player paused/stopped or seeked
+            // Player stopped, paused or seeked
         } catch (e: Exception) {
             Log.d(TAG, "Stream write ended: ${e.message}")
-        } finally {
-            try { raf.close() } catch (_: Exception) {}
         }
     }
 

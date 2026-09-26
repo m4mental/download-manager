@@ -112,13 +112,16 @@ dependencies {
   implementation(libs.androidx.datastore.preferences)
   implementation(libs.kotlinx.serialization.json)
 
-  // OkHttp Networking
+  // OkHttp Networking & DNS-over-HTTPS
   implementation(libs.okhttp)
   implementation(libs.okhttp.logging)
+  implementation(libs.okhttp.dnsoverhttps)
+
+  // Media3 / ExoPlayer for HLS adaptive streaming and background download
+  implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.exoplayer.hls)
+  implementation(libs.androidx.media3.datasource.okhttp)
 
   // Coroutines
   implementation(libs.kotlinx.coroutines.android)
-
-  // DataStore
-  implementation(libs.androidx.datastore.preferences)
 }
