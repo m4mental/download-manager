@@ -30,3 +30,11 @@
 -keep class org.mozilla.geckoview.** { *; }
 -dontwarn org.mozilla.geckoview.**
 -dontwarn org.mozilla.gecko.**
+
+# NewPipe Extractor & Rhino JavaScript engine
+-keep class org.schabi.newpipe.extractor.** { *; }
+-keep class org.mozilla.javascript.** { *; }
+-keep class org.mozilla.classfile.ClassFileWriter
+-dontwarn org.mozilla.javascript.tools.**
+-dontwarn org.schabi.newpipe.extractor.**
+

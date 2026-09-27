@@ -68,6 +68,7 @@ import com.example.speeddown.engine.GeckoTabSession
 import com.example.speeddown.engine.HlsStreamVariant
 import com.example.speeddown.engine.SecureDnsHelper
 import org.mozilla.geckoview.GeckoView
+import com.example.speeddown.extractor.YouTubeExtractorEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -818,6 +819,26 @@ fun BrowserScreen(
                             )
 
                             HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                            if (YouTubeExtractorEngine.isYouTubeUrl(currentTab.url)) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text("Download YouTube Video / Music", fontWeight = FontWeight.Bold, color = Color(0xFFFF0000))
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Filled.PlayArrow,
+                                            contentDescription = "Download YouTube",
+                                            tint = Color(0xFFFF0000)
+                                        )
+                                    },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        onStartDownload(currentTab.url, "", defaultThreads)
+                                    }
+                                )
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                            }
 
                             // Video Capture / Media Sniffer shifted inside 3-dot menu!
                             DropdownMenuItem(

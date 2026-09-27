@@ -52,9 +52,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Initialize AdBlockEngine and pre-warm Mozilla GeckoView & built-in uBlock Origin engine
+        // Initialize AdBlockEngine, GeckoView, and YouTubeExtractorEngine
         com.example.speeddown.engine.AdBlockEngine.init(applicationContext)
         com.example.speeddown.engine.GeckoEngine.getOrCreateRuntime(applicationContext)
+        com.example.speeddown.extractor.YouTubeExtractorEngine.init(applicationContext)
 
         handleIntent(intent)
 
@@ -95,13 +96,15 @@ class MainActivity : ComponentActivity() {
         } ?: return
 
         val clean = rawUrl.trim()
-        if (clean.startsWith("magnet:?xt=urn:btih:", ignoreCase = true)) {
-            viewModel.setIncomingShareUrl(clean)
+        val magnetIndex = clean.indexOf("magnet:?xt=urn:btih:", ignoreCase = true)
+        if (magnetIndex != -1) {
+            val magnetUrl = clean.substring(magnetIndex).substringBefore(" ").substringBefore("\n").trim()
+            viewModel.setIncomingShareUrl(magnetUrl)
             return
         }
 
         val matcher = Regex("https?://[\\w\\d:#@%/;\$()~_?\\+-=\\\\\\.&]+", RegexOption.IGNORE_CASE)
-        val extracted = matcher.find(clean)?.value ?: clean
+        val extracted = matcher.find(clean)?.value?.trimEnd('.', ',', ')', ']', '}', '>', '"', '\'', ';', ':') ?: clean
         if (extracted.startsWith("http://") || extracted.startsWith("https://")) {
             viewModel.setIncomingShareUrl(extracted)
         }

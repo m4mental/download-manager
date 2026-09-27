@@ -31,6 +31,9 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
     private val _incomingShareUrl = MutableStateFlow<String?>(null)
     val incomingShareUrl = _incomingShareUrl.asStateFlow()
 
+    private val _youtubeExtractionState = MutableStateFlow<YouTubeExtractionState>(YouTubeExtractionState.Idle)
+    val youtubeExtractionState = _youtubeExtractionState.asStateFlow()
+
     fun setIncomingShareUrl(url: String) {
         _incomingShareUrl.value = url
     }
@@ -39,12 +42,31 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         _incomingShareUrl.value = null
     }
 
+    fun extractYouTubeMedia(url: String) {
+        viewModelScope.launch {
+            _youtubeExtractionState.value = YouTubeExtractionState.Loading(url)
+            val result = com.example.speeddown.extractor.YouTubeExtractorEngine.extract(url, getApplication())
+            result.fold(
+                onSuccess = { info ->
+                    _youtubeExtractionState.value = YouTubeExtractionState.Success(info)
+                },
+                onFailure = { error ->
+                    _youtubeExtractionState.value = YouTubeExtractionState.Error(error.message ?: "Failed to extract YouTube media")
+                }
+            )
+        }
+    }
+
+    fun clearYouTubeExtraction() {
+        _youtubeExtractionState.value = YouTubeExtractionState.Idle
+    }
+
     fun updateSettings(newSettings: DownloadSettings) {
         viewModelScope.launch { repo.updateSettings(newSettings) }
     }
 
-    fun addDownload(url: String, fileName: String, threads: Int) {
-        viewModelScope.launch { repo.addDownload(url = url, fileName = fileName, threads = threads) }
+    fun addDownload(url: String, fileName: String, threads: Int, audioUrl: String? = null) {
+        viewModelScope.launch { repo.addDownload(url = url, fileName = fileName, threads = threads, audioUrl = audioUrl) }
     }
 
     fun addBatchDownloads(urls: List<String>, threads: Int) {
@@ -100,4 +122,11 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
     fun clearCompleted() {
         viewModelScope.launch { repo.clearCompleted() }
     }
+}
+
+sealed class YouTubeExtractionState {
+    object Idle : YouTubeExtractionState()
+    data class Loading(val url: String) : YouTubeExtractionState()
+    data class Success(val mediaInfo: com.example.speeddown.extractor.YouTubeMediaInfo) : YouTubeExtractionState()
+    data class Error(val message: String) : YouTubeExtractionState()
 }

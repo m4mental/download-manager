@@ -33,7 +33,12 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
-    suspend fun addDownload(url: String, fileName: String, threads: Int = 4): Long {
+    suspend fun addDownload(
+        url: String,
+        fileName: String,
+        threads: Int = 4,
+        audioUrl: String? = null
+    ): Long {
         val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val appExtDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         val hasManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()
@@ -82,7 +87,8 @@ class DownloadRepository(private val context: Context) {
             category = category,
             isStreamable = isStreamable,
             isTorrent = isMagnet,
-            isHls = isHls
+            isHls = isHls,
+            audioUrl = audioUrl
         )
         store.upsert(item)
         startServiceAction(DownloadService.ACTION_START, item.id)

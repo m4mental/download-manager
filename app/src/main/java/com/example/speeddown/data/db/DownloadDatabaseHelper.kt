@@ -20,7 +20,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
 
     companion object {
         const val DATABASE_NAME = "speeddown_downloads.db"
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 2
         const val TABLE_DOWNLOADS = "downloads"
 
         const val COL_ID = "id"
@@ -43,6 +43,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         const val COL_TORRENT_PEERS = "torrentPeers"
         const val COL_TORRENT_SEEDS = "torrentSeeds"
         const val COL_ORIGINAL_URL = "originalUrl"
+        const val COL_AUDIO_URL = "audioUrl"
 
         @Volatile
         private var instance: DownloadDatabaseHelper? = null
@@ -76,7 +77,8 @@ class DownloadDatabaseHelper private constructor(context: Context) :
                 $COL_IS_HLS INTEGER NOT NULL DEFAULT 0,
                 $COL_TORRENT_PEERS INTEGER NOT NULL DEFAULT 0,
                 $COL_TORRENT_SEEDS INTEGER NOT NULL DEFAULT 0,
-                $COL_ORIGINAL_URL TEXT
+                $COL_ORIGINAL_URL TEXT,
+                $COL_AUDIO_URL TEXT
             );
         """.trimIndent()
         db.execSQL(createSql)
@@ -86,7 +88,11 @@ class DownloadDatabaseHelper private constructor(context: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // Future schema migrations
+        if (oldVersion < 2) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE_DOWNLOADS ADD COLUMN $COL_AUDIO_URL TEXT;")
+            } catch (_: Exception) {}
+        }
     }
 
     suspend fun getAllDownloads(): List<DownloadItem> = withContext(Dispatchers.IO) {
@@ -251,7 +257,11 @@ class DownloadDatabaseHelper private constructor(context: Context) :
             isHls = c.getInt(c.getColumnIndexOrThrow(COL_IS_HLS)) == 1,
             torrentPeers = c.getInt(c.getColumnIndexOrThrow(COL_TORRENT_PEERS)),
             torrentSeeds = c.getInt(c.getColumnIndexOrThrow(COL_TORRENT_SEEDS)),
-            originalUrl = c.getString(c.getColumnIndexOrThrow(COL_ORIGINAL_URL))
+            originalUrl = c.getString(c.getColumnIndexOrThrow(COL_ORIGINAL_URL)),
+            audioUrl = runCatching {
+                val idx = c.getColumnIndex(COL_AUDIO_URL)
+                if (idx >= 0 && !c.isNull(idx)) c.getString(idx) else null
+            }.getOrNull()
         )
     }
 
@@ -277,6 +287,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
             put(COL_TORRENT_PEERS, item.torrentPeers)
             put(COL_TORRENT_SEEDS, item.torrentSeeds)
             put(COL_ORIGINAL_URL, item.originalUrl)
+            put(COL_AUDIO_URL, item.audioUrl)
         }
     }
 }

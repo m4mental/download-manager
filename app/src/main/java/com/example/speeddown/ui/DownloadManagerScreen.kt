@@ -46,7 +46,11 @@ import com.example.speeddown.ui.dialogs.RefreshUrlDialog
 import com.example.speeddown.ui.dialogs.DuplicateWarningDialog
 import com.example.speeddown.ui.dialogs.ChecksumDialog
 import com.example.speeddown.ui.components.*
+import com.example.speeddown.extractor.YouTubeExtractorEngine
+import com.example.speeddown.ui.YouTubeDownloadBottomSheet
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 // ─── Tabs ────────────────────────────────────────────────────────────────────
 enum class DownloadTab(val title: String) {
@@ -87,8 +91,14 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 navigatedFromBrowser = true
             },
             onStartDownload = { url, name, threads ->
-                viewModel.addDownload(url, name, threads)
-                android.widget.Toast.makeText(context, "Added to SpeedDown: $name", android.widget.Toast.LENGTH_SHORT).show()
+                if (YouTubeExtractorEngine.isYouTubeUrl(url)) {
+                    showBrowser = false
+                    viewModel.extractYouTubeMedia(url)
+                    // Note: YouTube sheet will show
+                } else {
+                    viewModel.addDownload(url, name, threads)
+                    android.widget.Toast.makeText(context, "Added to SpeedDown: $name", android.widget.Toast.LENGTH_SHORT).show()
+                }
             }
         )
         return
@@ -111,6 +121,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
 
     var showAddDialog by remember { mutableStateOf(false) }
     var initialUrlForDialog by remember { mutableStateOf<String?>(null) }
+    var showYouTubeSheet by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var errorDetailItem by remember { mutableStateOf<DownloadItem?>(null) }
     var deleteTargetItem by remember { mutableStateOf<DownloadItem?>(null) }
@@ -129,11 +140,16 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     val clipboardManager = LocalClipboardManager.current
     var clipboardUrl by remember { mutableStateOf<String?>(null) }
 
-    // Auto-open AddDownloadDialog when a link is shared to SpeedDown
+    // Auto-open AddDownloadDialog or YouTube Sheet when a link is shared to SpeedDown
     LaunchedEffect(incomingShareUrl) {
         incomingShareUrl?.let { url ->
-            initialUrlForDialog = url
-            showAddDialog = true
+            if (YouTubeExtractorEngine.isYouTubeUrl(url)) {
+                viewModel.extractYouTubeMedia(url)
+                showYouTubeSheet = true
+            } else {
+                initialUrlForDialog = url
+                showAddDialog = true
+            }
             viewModel.onShareUrlHandled()
         }
     }
@@ -321,22 +337,34 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
 
             // ─── Clipboard Link Auto-Sniffer Banner ───────────────────────────
             clipboardUrl?.let { clipUrl ->
+                val isYt = YouTubeExtractorEngine.isYouTubeUrl(clipUrl)
+                val bannerColor = if (isYt) Color(0xFFFF0000) else Purple
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 6.dp),
                     shape = RoundedCornerShape(12.dp),
-                    color = Purple.copy(alpha = 0.12f),
-                    border = BorderStroke(1.dp, Purple.copy(alpha = 0.35f))
+                    color = bannerColor.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, bannerColor.copy(alpha = 0.35f))
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Filled.ContentPaste, null, tint = Purple, modifier = Modifier.size(20.dp))
+                        Icon(
+                            if (isYt) Icons.Filled.PlayArrow else Icons.Filled.ContentPaste,
+                            null,
+                            tint = bannerColor,
+                            modifier = Modifier.size(20.dp)
+                        )
                         Spacer(Modifier.width(8.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Link in clipboard", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Purple)
+                            Text(
+                                if (isYt) "YouTube Media in clipboard" else "Link in clipboard",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = bannerColor
+                            )
                             Text(
                                 clipUrl,
                                 fontSize = 11.sp,
@@ -348,16 +376,26 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                         Spacer(Modifier.width(8.dp))
                         Button(
                             onClick = {
-                                initialUrlForDialog = clipUrl
-                                showAddDialog = true
-                                clipboardUrl = null
+                                if (isYt) {
+                                    viewModel.extractYouTubeMedia(clipUrl)
+                                    showYouTubeSheet = true
+                                    clipboardUrl = null
+                                } else {
+                                    initialUrlForDialog = clipUrl
+                                    showAddDialog = true
+                                    clipboardUrl = null
+                                }
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = Purple),
+                            colors = ButtonDefaults.buttonColors(containerColor = bannerColor),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                             modifier = Modifier.height(28.dp),
                             shape = RoundedCornerShape(6.dp)
                         ) {
-                            Text("Download", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                if (isYt) "Extract" else "Download",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                         IconButton(
                             onClick = { clipboardUrl = null },
@@ -509,6 +547,21 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 viewModel.addBatchDownloads(urls, threads)
                 showAddDialog = false
                 initialUrlForDialog = null
+            },
+            onExtractYouTube = { ytUrl ->
+                showAddDialog = false
+                initialUrlForDialog = null
+                viewModel.extractYouTubeMedia(ytUrl)
+                showYouTubeSheet = true
+            }
+        )
+    }
+    if (showYouTubeSheet) {
+        YouTubeDownloadBottomSheet(
+            viewModel = viewModel,
+            onDismiss = {
+                showYouTubeSheet = false
+                viewModel.clearYouTubeExtraction()
             }
         )
     }
@@ -1254,18 +1307,198 @@ fun DeleteConfirmationDialog(
 }
 
 // ─── Add Download Dialog (Single Link & Batch Downloads) ──────────────────────
+// Helper to check if a filename is a web script or generic placeholder
+fun isGenericOrScript(name: String): Boolean {
+    if (name.isBlank()) return true
+    val lower = name.trim().lowercase()
+    val scriptExts = listOf(".php", ".asp", ".aspx", ".jsp", ".cgi", ".html", ".htm", ".action", ".do")
+    if (scriptExts.any { lower.endsWith(it) }) return true
+    val genericBases = setOf("download", "get", "file", "media", "export", "uc", "attachment", "view", "index", "default")
+    val base = lower.substringBeforeLast('.')
+    return genericBases.contains(base) || genericBases.contains(lower)
+}
+
+// Parse standard and RFC 5987 / RFC 6266 Content-Disposition headers
+fun parseContentDisposition(disposition: String?): String? {
+    if (disposition.isNullOrBlank()) return null
+    return try {
+        // Priority 1: RFC 5987 filename*=UTF-8''filename.ext
+        val starRegex = Regex("""filename\*\s*=\s*(?:[A-Za-z0-9_-]+''|")?([^;";]+)""", RegexOption.IGNORE_CASE)
+        val starMatch = starRegex.find(disposition)?.groupValues?.get(1)?.trim()?.trim('"', '\'')
+        if (!starMatch.isNullOrBlank()) {
+            val decoded = java.net.URLDecoder.decode(starMatch, "UTF-8")
+            if (decoded.isNotBlank()) return decoded
+        }
+
+        // Priority 2: Standard filename="name.ext" or filename=name.ext
+        val stdRegex = Regex("""filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;]+)""", RegexOption.IGNORE_CASE)
+        val match = stdRegex.find(disposition)
+        val candidate = match?.let { it.groupValues[1].ifBlank { it.groupValues[2] } }?.trim()?.trim('"', '\'')
+        if (!candidate.isNullOrBlank()) {
+            val decoded = try { java.net.URLDecoder.decode(candidate, "UTF-8") } catch (_: Exception) { candidate }
+            if (decoded.isNotBlank()) return decoded
+        }
+        null
+    } catch (_: Exception) {
+        null
+    }
+}
+
+// Helper to instantly parse clean filename from URL or Magnet link
+fun extractFileNameFromUrl(rawUrl: String): String {
+    if (rawUrl.isBlank()) return ""
+    val clean = rawUrl.trim()
+    val magnetIndex = clean.indexOf("magnet:?xt=urn:btih:", ignoreCase = true)
+    if (magnetIndex != -1) {
+        val magnet = clean.substring(magnetIndex).substringBefore(" ").substringBefore("\n").trim()
+        val meta = com.example.speeddown.engine.TorrentEngine.parseMagnet(magnet)
+        return meta?.displayName?.replace(Regex("[\\\\/:*?\"<>|]"), "_")?.trim() ?: "torrent_download"
+    }
+    return try {
+        val uriWithoutFragment = clean.substringBefore("#")
+        val urlWithoutQuery = uriWithoutFragment.substringBefore("?").trimEnd('/')
+        val pathSegment = urlWithoutQuery.substringAfterLast('/')
+        val decodedPath = if (pathSegment.isNotBlank()) {
+            try { java.net.URLDecoder.decode(pathSegment, "UTF-8") } catch (_: Exception) { pathSegment }
+        } else ""
+
+        val webScriptExts = setOf("php", "asp", "aspx", "jsp", "cgi", "html", "htm", "action", "do")
+        val ext = decodedPath.substringAfterLast('.', "").lowercase()
+
+        // 1. If path segment has a genuine file extension (e.g. .zip, .apk, .mp4, .bin, .pdf), prioritize it!
+        if (decodedPath.isNotBlank() && ext.isNotEmpty() && !webScriptExts.contains(ext) && decodedPath.length > ext.length + 1) {
+            return decodedPath.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+        }
+
+        // 2. Otherwise check query parameters for file names (e.g. ?file=..., ?filename=..., ?name=...)
+        if (uriWithoutFragment.contains("?")) {
+            val queryString = uriWithoutFragment.substringAfter("?")
+            val queryParams = queryString.split("&")
+            val nameKeys = listOf("filename", "file_name", "file", "name", "fn", "title")
+            for (key in nameKeys) {
+                val param = queryParams.firstOrNull { it.startsWith("$key=", ignoreCase = true) }
+                if (param != null) {
+                    val rawVal = param.substringAfter("=")
+                    val decodedVal = try { java.net.URLDecoder.decode(rawVal, "UTF-8") } catch (_: Exception) { rawVal }
+                    val cleanVal = decodedVal.trim().trim('"', '\'')
+                    val valExt = cleanVal.substringAfterLast('.', "").lowercase()
+                    if (cleanVal.isNotBlank() && (valExt.isNotEmpty() || !decodedPath.contains("."))) {
+                        return cleanVal.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+                    }
+                }
+            }
+            // Check for response-content-disposition in query
+            val rcdParam = queryParams.firstOrNull { it.startsWith("response-content-disposition=", ignoreCase = true) }
+            if (rcdParam != null) {
+                val rawRcd = rcdParam.substringAfter("=")
+                val decodedRcd = try { java.net.URLDecoder.decode(rawRcd, "UTF-8") } catch (_: Exception) { rawRcd }
+                val parsed = parseContentDisposition(decodedRcd)
+                if (!parsed.isNullOrBlank()) {
+                    return parsed.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+                }
+            }
+        }
+
+        // 3. Fallback to decodedPath if non-blank, else ""
+        if (decodedPath.isNotBlank()) {
+            decodedPath.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+        } else {
+            ""
+        }
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+// ─── Add Download Dialog (Single Link & Batch Downloads) ──────────────────────
 @Composable
 fun AddDownloadDialog(
     initialUrl: String? = null,
     onDismiss: () -> Unit,
     onAdd: (url: String, name: String, threads: Int) -> Unit,
-    onAddBatch: (urls: List<String>, threads: Int) -> Unit
+    onAddBatch: (urls: List<String>, threads: Int) -> Unit,
+    onExtractYouTube: (url: String) -> Unit = {}
 ) {
     var selectedTab by remember { mutableStateOf(0) }
     var url by remember { mutableStateOf(initialUrl ?: "") }
-    var fileName by remember { mutableStateOf("") }
+    var fileName by remember { mutableStateOf(extractFileNameFromUrl(initialUrl ?: "")) }
+    var userEditedFileName by remember { mutableStateOf(false) }
     var threads by remember { mutableStateOf(16) }
     var urlError by remember { mutableStateOf("") }
+
+    // Auto-fill and refresh fileName whenever initialUrl is passed or updated
+    LaunchedEffect(initialUrl) {
+        if (!initialUrl.isNullOrBlank()) {
+            url = initialUrl
+            if (!userEditedFileName || fileName.isBlank() || isGenericOrScript(fileName)) {
+                val extracted = extractFileNameFromUrl(initialUrl)
+                if (extracted.isNotBlank()) {
+                    fileName = extracted
+                }
+            }
+        }
+    }
+
+    // Auto-resolve real filename from server Content-Disposition or HTTP redirects
+    LaunchedEffect(url) {
+        val clean = url.trim()
+        if ((clean.startsWith("http://") || clean.startsWith("https://")) && !YouTubeExtractorEngine.isYouTubeUrl(clean)) {
+            if (!userEditedFileName && (fileName.isBlank() || !fileName.contains(".") || isGenericOrScript(fileName))) {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val client = okhttp3.OkHttpClient.Builder()
+                            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                            .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                            .followRedirects(true)
+                            .build()
+                        val req = okhttp3.Request.Builder()
+                            .url(clean)
+                            .header("User-Agent", com.example.speeddown.engine.MultiThreadDownloader.BROWSER_USER_AGENT)
+                            .header("Range", "bytes=0-0")
+                            .build()
+                        client.newCall(req).execute().use { resp ->
+                            val disposition = resp.header("Content-Disposition")
+                            var resolvedName = parseContentDisposition(disposition)
+                            if (resolvedName.isNullOrBlank()) {
+                                val finalPath = resp.request.url.encodedPath.substringAfterLast("/")
+                                val decoded = try { java.net.URLDecoder.decode(finalPath, "UTF-8") } catch (_: Exception) { finalPath }
+                                if (decoded.isNotBlank() && decoded.contains(".") && !isGenericOrScript(decoded)) {
+                                    resolvedName = decoded
+                                }
+                            }
+                            if (resolvedName.isNullOrBlank() && !fileName.contains(".")) {
+                                val cType = resp.header("Content-Type")?.substringBefore(";")?.trim()?.lowercase() ?: ""
+                                val ext = when (cType) {
+                                    "application/pdf" -> ".pdf"
+                                    "application/zip" -> ".zip"
+                                    "application/vnd.android.package-archive" -> ".apk"
+                                    "video/mp4" -> ".mp4"
+                                    "video/webm" -> ".webm"
+                                    "video/x-matroska" -> ".mkv"
+                                    "audio/mpeg" -> ".mp3"
+                                    "audio/mp4" -> ".m4a"
+                                    "image/jpeg" -> ".jpg"
+                                    "image/png" -> ".png"
+                                    else -> null
+                                }
+                                if (ext != null) {
+                                    resolvedName = if (fileName.isNotBlank() && !isGenericOrScript(fileName)) "$fileName$ext" else "download$ext"
+                                }
+                            }
+                            if (!resolvedName.isNullOrBlank()) {
+                                val cleanName = resolvedName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+                                withContext(Dispatchers.Main) {
+                                    if (!userEditedFileName) {
+                                        fileName = cleanName
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+    }
 
     var batchText by remember { mutableStateOf("") }
     val clipboardManager = LocalClipboardManager.current
@@ -1327,17 +1560,14 @@ fun AddDownloadDialog(
                             urlError = ""
                             if (newUrl.startsWith("magnet:?xt=urn:btih:", ignoreCase = true)) {
                                 val meta = com.example.speeddown.engine.TorrentEngine.parseMagnet(newUrl)
-                                if (meta != null && fileName.isBlank()) {
+                                if (meta != null && (!userEditedFileName || fileName.isBlank())) {
                                     fileName = meta.displayName
                                 }
-                            } else if (fileName.isBlank()) {
-                                try {
-                                    val clean = newUrl.trim()
-                                    val candidate = clean.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                                    if (candidate.isNotBlank() && candidate.contains(".")) {
-                                        fileName = java.net.URLDecoder.decode(candidate, "UTF-8")
-                                    }
-                                } catch (_: Exception) {}
+                            } else if (!userEditedFileName || fileName.isBlank() || isGenericOrScript(fileName)) {
+                                val extracted = extractFileNameFromUrl(newUrl)
+                                if (extracted.isNotBlank()) {
+                                    fileName = extracted
+                                }
                             }
                         },
                         label = { Text("Download URL *") },
@@ -1354,13 +1584,11 @@ fun AddDownloadDialog(
                                 if (clipText.isNotBlank()) {
                                     url = clipText
                                     urlError = ""
-                                    if (fileName.isBlank()) {
-                                        try {
-                                            val candidate = clipText.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                                            if (candidate.isNotBlank() && candidate.contains(".")) {
-                                                fileName = java.net.URLDecoder.decode(candidate, "UTF-8")
-                                            }
-                                        } catch (_: Exception) {}
+                                    if (!userEditedFileName || fileName.isBlank() || isGenericOrScript(fileName)) {
+                                        val extracted = extractFileNameFromUrl(clipText)
+                                        if (extracted.isNotBlank()) {
+                                            fileName = extracted
+                                        }
                                     }
                                 }
                             }) {
@@ -1368,9 +1596,44 @@ fun AddDownloadDialog(
                             }
                         }
                     )
+
+                    val isYouTube = remember(url) { YouTubeExtractorEngine.isYouTubeUrl(url) }
+                    if (isYouTube) {
+                        Surface(
+                            color = Color(0xFFFF0000).copy(alpha = 0.12f),
+                            border = BorderStroke(1.dp, Color(0xFFFF0000).copy(alpha = 0.35f)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.PlayArrow, null, tint = Color(0xFFFF0000), modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "YouTube Link Detected",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp,
+                                        color = Color(0xFFFF0000)
+                                    )
+                                    Text(
+                                        "Extract high-speed M4A/Opus Music or MP4 Video streams directly",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     OutlinedTextField(
                         value = fileName,
-                        onValueChange = { fileName = it },
+                        onValueChange = {
+                            fileName = it
+                            userEditedFileName = true
+                        },
                         label = { Text("File Name (optional)") },
                         placeholder = { Text("Auto-detected from URL") },
                         modifier = Modifier.fillMaxWidth(),
@@ -1493,6 +1756,8 @@ fun AddDownloadDialog(
         },
         confirmButton = {
             if (selectedTab == 0) {
+                val isYouTube = YouTubeExtractorEngine.isYouTubeUrl(url)
+                val buttonColor = if (isYouTube) Color(0xFFFF0000) else Purple
                 Button(
                     onClick = {
                         var cleaned = url.trim()
@@ -1505,17 +1770,28 @@ fun AddDownloadDialog(
                         if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
                             urlError = "URL must start with http:// or https://"; return@Button
                         }
-                        val name = fileName.ifBlank {
-                            cleaned.substringAfterLast("/").substringBefore("?").substringBefore("#")
-                                .ifBlank { "download_${System.currentTimeMillis()}" }
+                        if (YouTubeExtractorEngine.isYouTubeUrl(cleaned)) {
+                            onExtractYouTube(cleaned)
+                        } else {
+                            val name = fileName.ifBlank {
+                                cleaned.substringAfterLast("/").substringBefore("?").substringBefore("#")
+                                    .ifBlank { "download_${System.currentTimeMillis()}" }
+                            }
+                            onAdd(cleaned, name, threads)
                         }
-                        onAdd(cleaned, name, threads)
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Purple)
+                    colors = ButtonDefaults.buttonColors(containerColor = buttonColor)
                 ) {
-                    Icon(Icons.Filled.Download, null, modifier = Modifier.size(16.dp))
+                    Icon(
+                        if (isYouTube) Icons.Filled.PlayArrow else Icons.Filled.Download,
+                        null,
+                        modifier = Modifier.size(16.dp)
+                    )
                     Spacer(Modifier.width(6.dp))
-                    Text("Start Download", fontWeight = FontWeight.Bold)
+                    Text(
+                        if (isYouTube) "Extract Media" else "Start Download",
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             } else {
                 Button(

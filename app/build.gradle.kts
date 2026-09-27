@@ -63,6 +63,7 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        isCoreLibraryDesugaringEnabled = true
     }
     buildFeatures {
       compose = true
@@ -150,4 +151,10 @@ dependencies {
 
   // Mozilla GeckoView Engine
   implementation("org.mozilla.geckoview:geckoview-omni:130.0.20240913135723")
+
+  // Core Library Desugaring for Java 8+ APIs
+  coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+
+  // NewPipe Extractor for YouTube Music & Video stream resolution (zero heavy binaries)
+  implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.5")
 }

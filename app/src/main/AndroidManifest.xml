@@ -60,7 +60,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
 
+        <!-- Pure translucent pop-up activity for shared links (YouTube & direct downloads) -->
+        <activity
+            android:name=".ui.QuickDownloadActivity"
+            android:exported="true"
+            android:theme="@style/Theme.SpeedDown.TranslucentDialog"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:windowSoftInputMode="adjustResize">
             <!-- Accept links shared via 'Share' menu from browsers or apps -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
