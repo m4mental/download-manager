@@ -4,6 +4,10 @@ plugins {
   alias(libs.plugins.kotlin.serialization)
 }
 
+base {
+    archivesName.set("SpeedDown")
+}
+
 android {
     namespace = "com.example.speeddown"
     compileSdk = 36
@@ -14,7 +18,16 @@ android {
         versionCode = 1
         versionName = "1.0"
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = true
         }
     }
 
@@ -65,6 +78,9 @@ android {
     packaging {
       resources {
         excludes += "/META-INF/{AL2.0,LGPL2.1}"
+      }
+      jniLibs {
+        useLegacyPackaging = true
       }
     }
 }

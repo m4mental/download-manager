@@ -83,12 +83,35 @@ jobs:
           echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
-      - name: Generate Changelog from Commits
+      - name: Organize Architecture Release APKs
+        run: |
+          mkdir -p release-apks
+          cd app/build/outputs/apk/release
+          for f in *.apk; do
+            if [ -f "$f" ]; then
+              clean_name=$(echo "$f" | sed 's/^app-/SpeedDown-/')
+              cp "$f" "../../../../release-apks/$clean_name"
+              echo "Prepared: $clean_name"
+            fi
+          done
+          ls -lh ../../../../release-apks
+
+      - name: Generate Changelog and Architecture Guide
         id: changelog
         run: |
           echo "### 🚀 SpeedDown Release Notes" > changelog.md
           echo "" >> changelog.md
           echo "Commit: \`${{ github.sha }}\`" >> changelog.md
+          echo "" >> changelog.md
+          echo "### 📱 Which APK should you download? (Architecture Guide)" >> changelog.md
+          echo "| File Name | CPU Architecture | Compatible Devices | Size |" >> changelog.md
+          echo "| :--- | :--- | :--- | :--- |" >> changelog.md
+          echo "| **\`SpeedDown-arm64-v8a-release.apk\`** | **arm64-v8a** (64-bit ARM) | **90%+ Modern Android Phones** (Snapdragon, MediaTek, Tensor, Exynos) | **~82 MB** (Recommended) |" >> changelog.md
+          echo "| **\`SpeedDown-armeabi-v7a-release.apk\`** | **armeabi-v7a** (32-bit ARM) | Older 32-bit Android Phones | **~79 MB** |" >> changelog.md
+          echo "| **\`SpeedDown-x86_64-release.apk\`** | **x86_64** (Intel / AMD 64-bit) | PC Emulators & ChromeOS | **~86 MB** |" >> changelog.md
+          echo "| **\`SpeedDown-universal-release.apk\`** | **Universal All-in-One** | Works on Any Android Device | **~208 MB** |" >> changelog.md
+          echo "" >> changelog.md
+          echo "> 💡 **Tip:** Agar aap normal modern smartphone use kar rahe hain to **\`SpeedDown-arm64-v8a-release.apk\`** download karein." >> changelog.md
           echo "" >> changelog.md
           echo "#### Recent Changes:" >> changelog.md
           git log -1 --pretty=format:"%s%n%n%b" >> changelog.md
@@ -101,6 +124,6 @@ jobs:
           body_path: changelog.md
           prerelease: ${{ steps.release_info.outputs.prerelease == 'true' }}
           files: |
-            app/build/outputs/apk/release/*.apk
+            release-apks/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
