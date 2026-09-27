@@ -86,15 +86,15 @@ jobs:
       - name: Organize Architecture Release APKs
         run: |
           mkdir -p release-apks
-          cd app/build/outputs/apk/release
-          for f in *.apk; do
+          for f in app/build/outputs/apk/release/*.apk; do
             if [ -f "$f" ]; then
-              clean_name=$(echo "$f" | sed 's/^app-/SpeedDown-/')
-              cp "$f" "../../../../release-apks/$clean_name"
+              filename="$(basename "$f")"
+              clean_name="$(echo "$filename" | sed 's/^app-/SpeedDown-/')"
+              cp "$f" "release-apks/$clean_name"
               echo "Prepared: $clean_name"
             fi
           done
-          ls -lh ../../../../release-apks
+          ls -lh release-apks
 
       - name: Generate Changelog and Architecture Guide
         id: changelog
