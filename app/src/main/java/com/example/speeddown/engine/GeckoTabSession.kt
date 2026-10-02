@@ -22,16 +22,27 @@ class GeckoTabSession(
     private val onMediaSniffed: (String) -> Unit,
     private val onDownloadRequested: (url: String, fileName: String, threads: Int) -> Unit,
     val defaultThreads: Int = 32,
+    val browserSettings: com.example.speeddown.data.BrowserSettings = com.example.speeddown.data.BrowserSettings(),
     private val onAdBlocked: () -> Unit = {},
     private val onFullScreenChanged: (Boolean) -> Unit = {}
 ) {
     val session: GeckoSession
     private val mainHandler = Handler(Looper.getMainLooper())
+    var currentBrowserSettings: com.example.speeddown.data.BrowserSettings = browserSettings
+        private set
+
+    fun updateSettings(newSettings: com.example.speeddown.data.BrowserSettings) {
+        currentBrowserSettings = newSettings
+        try {
+            session.settings.allowJavascript = newSettings.javaScriptEnabled
+        } catch (_: Exception) {}
+    }
 
     init {
         val settings = GeckoSessionSettings.Builder()
             .usePrivateMode(isIncognito)
             .userAgentMode(if (isDesktopMode) GeckoSessionSettings.USER_AGENT_MODE_DESKTOP else GeckoSessionSettings.USER_AGENT_MODE_MOBILE)
+            .allowJavascript(browserSettings.javaScriptEnabled)
             .build()
 
         session = GeckoSession(settings)
@@ -46,8 +57,8 @@ class GeckoTabSession(
                 android.util.Log.d("UBLOCK_STATUS", "onPopupPrompt intercepted: targetUri='$targetUri'")
 
                 // Block rogue popups, ad popunders, and blank popup traps
-                if (targetUri.isBlank() || targetUri == "about:blank" ||
-                    AdBlockEngine.isAd(targetUri) || AdBlockEngine.isRogueRedirect(targetUri)
+                if (currentBrowserSettings.blockPopups && (targetUri.isBlank() || targetUri == "about:blank" ||
+                    AdBlockEngine.isAd(targetUri) || AdBlockEngine.isRogueRedirect(targetUri))
                 ) {
                     AdBlockEngine.recordBlock()
                     mainHandler.post { onAdBlocked() }
@@ -107,7 +118,7 @@ class GeckoTabSession(
                 }
 
                 // Block rogue popups, ad popunders, and app-store hijacking intents
-                if (AdBlockEngine.isAd(uri) || AdBlockEngine.isRogueRedirect(uri)) {
+                if (browserSettings.blockPopups && (AdBlockEngine.isAd(uri) || AdBlockEngine.isRogueRedirect(uri))) {
                     android.util.Log.d("UBLOCK_STATUS", "Blocked rogue new session popup: $uri")
                     AdBlockEngine.recordBlock()
                     mainHandler.post { onAdBlocked() }

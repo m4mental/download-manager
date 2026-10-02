@@ -96,7 +96,7 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun openInNothingPlayer(item: DownloadItem): Boolean = repo.openInNothingPlayer(item)
 
-    fun streamInNothingPlayer(item: DownloadItem): Boolean = repo.streamInNothingPlayer(item)
+    fun streamInNothingPlayer(item: DownloadItem): Boolean = kotlinx.coroutines.runBlocking { repo.streamInNothingPlayer(item) }
 
     fun launchNothingPlayer(): Boolean = repo.launchNothingPlayerApp()
 

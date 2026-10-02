@@ -37,7 +37,7 @@ object FaviconLoader {
         }
     }
 
-    suspend fun getFavicon(context: Context, url: String): Bitmap? = withContext(Dispatchers.IO) {
+    suspend fun getFavicon(context: Context, url: String, isIncognito: Boolean = false): Bitmap? = withContext(Dispatchers.IO) {
         val domain = extractDomain(url)
         if (domain.isBlank() || domain.startsWith("speeddown") || domain.startsWith("about:")) {
             return@withContext null
@@ -45,6 +45,11 @@ object FaviconLoader {
 
         // 1. Check in-memory cache
         memoryCache.get(domain)?.let { return@withContext it }
+
+        // In incognito, do not contact third-party favicon services or write to cacheDir/favicons
+        if (isIncognito) {
+            return@withContext null
+        }
 
         // 2. Check disk cache
         val diskCacheDir = File(context.cacheDir, "favicons").apply { if (!exists()) mkdirs() }

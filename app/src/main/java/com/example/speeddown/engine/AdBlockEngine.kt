@@ -10,19 +10,22 @@ import java.util.concurrent.ConcurrentHashMap
 
 object AdBlockEngine {
 
+    @Volatile
     var isEnabled: Boolean = true
-    var blockedAdsCount: Int = 0
-        private set
+
+    private val _blockedAdsCount = java.util.concurrent.atomic.AtomicInteger(0)
+    val blockedAdsCount: Int
+        get() = _blockedAdsCount.get()
 
     private val domainSet = ConcurrentHashMap.newKeySet<String>()
     private var isInitialized = false
 
     fun resetCount() {
-        blockedAdsCount = 0
+        _blockedAdsCount.set(0)
     }
 
     fun recordBlock() {
-        blockedAdsCount++
+        _blockedAdsCount.incrementAndGet()
     }
 
     /**

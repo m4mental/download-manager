@@ -21,6 +21,7 @@ class DownloadService : Service() {
         const val ACTION_START = "ACTION_START"
         const val ACTION_PAUSE = "ACTION_PAUSE"
         const val ACTION_RESUME = "ACTION_RESUME"
+        const val ACTION_RESUME_ALL = "ACTION_RESUME_ALL"
         const val ACTION_CANCEL = "ACTION_CANCEL"
         const val EXTRA_DOWNLOAD_ID = "EXTRA_DOWNLOAD_ID"
         const val CHANNEL_ID = "SpeedDown_Channel"
@@ -39,6 +40,7 @@ class DownloadService : Service() {
 
     private fun acquireWakeLock() {
         try {
+            if (store.getActiveDownloads().isEmpty()) return
             if (wakeLock == null) {
                 val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
                 wakeLock = pm?.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "SpeedDown:DownloadWakeLock")?.apply {
@@ -69,20 +71,9 @@ class DownloadService : Service() {
         }
         val connectionPool = okhttp3.ConnectionPool(120, 5, TimeUnit.MINUTES)
 
-        val browserSettings = runCatching {
-            kotlinx.coroutines.runBlocking {
-                com.example.speeddown.data.BrowserSettingsStore.getInstance(applicationContext).getSnapshot()
-            }
-        }.getOrNull()
-
-        val dns = if (browserSettings != null) {
-            com.example.speeddown.engine.SecureDnsHelper.createOkHttpDns(browserSettings.dnsProvider, browserSettings.customDnsIp)
-        } else {
-            okhttp3.Dns.SYSTEM
-        }
-
+        // Initialize OkHttpClient without blocking main thread via runBlocking
         val client = OkHttpClient.Builder()
-            .dns(dns)
+            .dns(okhttp3.Dns.SYSTEM)
             .dispatcher(dispatcher)
             .connectionPool(connectionPool)
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -119,38 +110,55 @@ class DownloadService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Must call startForegroundCompat FIRST in every path before blocking work
+        startForegroundCompat()
+
         val action = intent?.action
         val id = intent?.getLongExtra(EXTRA_DOWNLOAD_ID, -1L) ?: -1L
-
-        if (action == ACTION_START || action == ACTION_RESUME) {
-            startForegroundCompat(id)
-        }
 
         when (action) {
             ACTION_START -> {
                 if (id != -1L) startDownload(id)
             }
+            ACTION_RESUME -> {
+                if (id != -1L) resumeDownload(id)
+            }
+            ACTION_RESUME_ALL -> {
+                serviceScope.launch {
+                    val items = store.getAll().filter {
+                        it.status == DownloadStatus.PAUSED || it.status == DownloadStatus.QUEUED
+                    }
+                    for (item in items) {
+                        store.updateStatus(item.id, DownloadStatus.QUEUED)
+                    }
+                    checkAndStartNextQueued()
+                    updateActiveNotification()
+                }
+            }
             ACTION_PAUSE -> {
                 if (id != -1L) {
-                    downloader.pauseDownload(id)
-                    hlsDownloader.pauseHls(id)
-                    torrentEngine.pauseTorrent(id)
                     serviceScope.launch {
+                        downloader.pauseDownload(id)
+                        hlsDownloader.pauseHls(id)
+                        torrentEngine.pauseTorrent(id)
+                        downloader.pauseAndJoinDownload(id)
+                        hlsDownloader.pauseAndJoinHls(id)
+                        torrentEngine.cancelAndJoinTorrent(id)
                         store.updateStatus(id, DownloadStatus.PAUSED)
                         updateActiveNotification()
                         checkAndStartNextQueued()
                     }
                 }
             }
-            ACTION_RESUME -> {
-                if (id != -1L) resumeDownload(id)
-            }
             ACTION_CANCEL -> {
                 if (id != -1L) {
-                    downloader.cancelDownload(id)
-                    hlsDownloader.cancelHls(id)
-                    torrentEngine.cancelTorrent(id)
                     serviceScope.launch {
+                        downloader.cancelDownload(id)
+                        hlsDownloader.cancelHls(id)
+                        torrentEngine.cancelTorrent(id)
+                        downloader.cancelAndJoinDownload(id)
+                        hlsDownloader.cancelAndJoinHls(id)
+                        torrentEngine.cancelAndJoinTorrent(id)
                         store.updateStatus(id, DownloadStatus.CANCELLED)
                         updateActiveNotification()
                         checkAndStartNextQueued()
@@ -159,8 +167,80 @@ class DownloadService : Service() {
                     updateActiveNotification()
                 }
             }
+            else -> {
+                // For null or unknown actions without active work, call stopSelf
+                serviceScope.launch {
+                    if (store.getActiveDownloads().isEmpty()) {
+                        releaseWakeLock()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            stopForeground(true)
+                        }
+                        isForeground = false
+                        stopSelf()
+                    } else {
+                        updateActiveNotification()
+                    }
+                }
+            }
         }
         return START_NOT_STICKY
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        // API 35+ foreground service timeout: pause active downloads, persist state, post notification with resume action
+        serviceScope.launch {
+            val active = store.getActiveDownloads()
+            for (item in active) {
+                downloader.pauseDownload(item.id)
+                hlsDownloader.pauseHls(item.id)
+                torrentEngine.pauseTorrent(item.id)
+                downloader.pauseAndJoinDownload(item.id)
+                hlsDownloader.pauseAndJoinHls(item.id)
+                torrentEngine.cancelAndJoinTorrent(item.id)
+                store.updateStatus(item.id, DownloadStatus.PAUSED)
+            }
+            postDownloadsPausedNotification()
+            releaseWakeLock()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            isForeground = false
+            stopSelf(startId)
+        }
+    }
+
+    private fun postDownloadsPausedNotification() {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val resumeIntent = Intent(this, DownloadService::class.java).apply {
+            action = ACTION_RESUME_ALL
+        }
+        val resumePendingIntent = PendingIntent.getService(
+            this,
+            9999,
+            resumeIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val openIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Downloads Paused")
+            .setContentText("Downloads were paused due to system execution timeout. Tap to resume.")
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .addAction(android.R.drawable.ic_media_play, "Resume All", resumePendingIntent)
+            .build()
+        nm.notify(NOTIFICATION_ID + 1, notification)
     }
 
     private fun isWifiConnected(): Boolean {
@@ -205,6 +285,11 @@ class DownloadService : Service() {
                 updateActiveNotification()
                 return@launch
             }
+
+            // Before a new run, cancel and join any previous runs
+            downloader.cancelAndJoinDownload(downloadId)
+            hlsDownloader.cancelAndJoinHls(downloadId)
+            torrentEngine.cancelAndJoinTorrent(downloadId)
 
             store.updateStatus(downloadId, DownloadStatus.DOWNLOADING)
             startForegroundCompat(downloadId, item.fileName)

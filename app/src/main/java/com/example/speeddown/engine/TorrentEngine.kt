@@ -71,10 +71,219 @@ class TorrentEngine(
                 return null
             }
         }
+        fun indexOfByte(bytes: ByteArray, target: Byte, start: Int): Int {
+            for (i in start until bytes.size) {
+                if (bytes[i] == target) return i
+            }
+            return -1
+        }
+
+        fun computeSha1Hex(bytes: ByteArray): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-1").digest(bytes)
+            return digest.joinToString("") { "%02X".format(it) }
+        }
+
+        fun decodeBase32(input: String): ByteArray? {
+            val base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+            val clean = input.trim().uppercase().replace("=", "")
+            val bytes = java.io.ByteArrayOutputStream()
+            var buffer = 0
+            var bitsLeft = 0
+            for (c in clean) {
+                val valIdx = base32Chars.indexOf(c)
+                if (valIdx < 0) return null
+                buffer = (buffer shl 5) or valIdx
+                bitsLeft += 5
+                if (bitsLeft >= 8) {
+                    bytes.write((buffer shr (bitsLeft - 8)) and 0xFF)
+                    bitsLeft -= 8
+                }
+            }
+            return bytes.toByteArray()
+        }
+
+        fun normalizeInfoHashToHex(infoHash: String): String {
+            val clean = infoHash.trim().uppercase()
+            if (clean.length == 40 && clean.all { it in "0123456789ABCDEF" }) {
+                return clean
+            }
+            if (clean.length == 32) {
+                val decoded = decodeBase32(clean)
+                if (decoded != null && decoded.size == 20) {
+                    return decoded.joinToString("") { "%02X".format(it) }
+                }
+            }
+            return clean
+        }
+
+        class BencodeParser(private val data: ByteArray, private var pos: Int = 0) {
+            fun hasMore(): Boolean = pos < data.size
+
+            fun parseAny(): Any? {
+                if (!hasMore()) return null
+                return when (data[pos].toInt().toChar()) {
+                    'i' -> parseInteger()
+                    'l' -> parseList()
+                    'd' -> parseDictionary()
+                    in '0'..'9' -> parseByteString()
+                    else -> null
+                }
+            }
+
+            fun parseInteger(): Long? {
+                if (!hasMore() || data[pos].toInt().toChar() != 'i') return null
+                pos++
+                val start = pos
+                while (hasMore() && data[pos].toInt().toChar() != 'e') {
+                    pos++
+                }
+                if (!hasMore()) return null
+                val str = String(data, start, pos - start, Charsets.US_ASCII)
+                pos++
+                return str.toLongOrNull()
+            }
+
+            fun parseByteString(): ByteArray? {
+                val colonIdx = indexOfByte(data, ':'.code.toByte(), pos)
+                if (colonIdx == -1) return null
+                val lenStr = String(data, pos, colonIdx - pos, Charsets.US_ASCII)
+                val len = lenStr.toIntOrNull() ?: return null
+                pos = colonIdx + 1
+                if (pos + len > data.size) return null
+                val result = data.copyOfRange(pos, pos + len)
+                pos += len
+                return result
+            }
+
+            fun parseList(): List<Any?>? {
+                if (!hasMore() || data[pos].toInt().toChar() != 'l') return null
+                pos++
+                val list = mutableListOf<Any?>()
+                while (hasMore() && data[pos].toInt().toChar() != 'e') {
+                    val item = parseAny() ?: return null
+                    list.add(item)
+                }
+                if (hasMore() && data[pos].toInt().toChar() == 'e') {
+                    pos++
+                }
+                return list
+            }
+
+            fun parseDictionary(): Map<String, Any?>? {
+                if (!hasMore() || data[pos].toInt().toChar() != 'd') return null
+                pos++
+                val map = mutableMapOf<String, Any?>()
+                while (hasMore() && data[pos].toInt().toChar() != 'e') {
+                    val keyBytes = parseByteString() ?: return null
+                    val key = String(keyBytes, Charsets.UTF_8)
+                    val value = parseAny() ?: return null
+                    map[key] = value
+                }
+                if (hasMore() && data[pos].toInt().toChar() == 'e') {
+                    pos++
+                }
+                return map
+            }
+
+            fun skipElement(): Int {
+                if (!hasMore()) return pos
+                when (data[pos].toInt().toChar()) {
+                    'i' -> {
+                        pos++
+                        while (hasMore() && data[pos].toInt().toChar() != 'e') pos++
+                        if (hasMore()) pos++
+                    }
+                    'l', 'd' -> {
+                        pos++
+                        while (hasMore() && data[pos].toInt().toChar() != 'e') {
+                            skipElement()
+                        }
+                        if (hasMore()) pos++
+                    }
+                    in '0'..'9' -> {
+                        val colonIdx = indexOfByte(data, ':'.code.toByte(), pos)
+                        if (colonIdx == -1) {
+                            pos = data.size
+                        } else {
+                            val lenStr = String(data, pos, colonIdx - pos, Charsets.US_ASCII)
+                            val len = lenStr.toIntOrNull() ?: 0
+                            pos = (colonIdx + 1 + len).coerceAtMost(data.size)
+                        }
+                    }
+                    else -> pos++
+                }
+                return pos
+            }
+        }
+
+        fun parseBencodeUrlList(torrentBytes: ByteArray): List<String> {
+            try {
+                val parser = BencodeParser(torrentBytes)
+                val root = parser.parseDictionary() ?: return emptyList()
+                val urlListObj = root["url-list"] ?: return emptyList()
+                return when (urlListObj) {
+                    is ByteArray -> listOf(String(urlListObj, Charsets.UTF_8).trim()).filter { it.startsWith("https://", ignoreCase = true) }
+                    is List<*> -> urlListObj.mapNotNull { item ->
+                        when (item) {
+                            is ByteArray -> String(item, Charsets.UTF_8).trim()
+                            is String -> item.trim()
+                            else -> null
+                        }
+                    }.filter { it.startsWith("https://", ignoreCase = true) }
+                    is String -> if (urlListObj.startsWith("https://", ignoreCase = true)) listOf(urlListObj) else emptyList()
+                    else -> emptyList()
+                }
+            } catch (_: Exception) {
+                return emptyList()
+            }
+        }
+
+        fun extractBencodeInfoBytes(torrentBytes: ByteArray): ByteArray? {
+            try {
+                if (torrentBytes.isEmpty() || torrentBytes[0].toInt().toChar() != 'd') return null
+                var pos = 1
+                while (pos < torrentBytes.size && torrentBytes[pos].toInt().toChar() != 'e') {
+                    val colonIdx = indexOfByte(torrentBytes, ':'.code.toByte(), pos)
+                    if (colonIdx == -1) break
+                    val lenStr = String(torrentBytes, pos, colonIdx - pos, Charsets.US_ASCII)
+                    val keyLen = lenStr.toIntOrNull() ?: break
+                    val keyStart = colonIdx + 1
+                    val keyEnd = keyStart + keyLen
+                    if (keyEnd > torrentBytes.size) break
+                    val key = String(torrentBytes, keyStart, keyLen, Charsets.UTF_8)
+                    pos = keyEnd
+
+                    val valueStart = pos
+                    val parser = BencodeParser(torrentBytes, pos)
+                    val valueEnd = parser.skipElement()
+                    pos = valueEnd
+
+                    if (key == "info") {
+                        return torrentBytes.copyOfRange(valueStart, valueEnd)
+                    }
+                }
+            } catch (_: Exception) {}
+            return null
+        }
+
+        fun verifyTorrentInfoHash(torrentBytes: ByteArray, expectedInfoHash: String): Boolean {
+            val infoBytes = extractBencodeInfoBytes(torrentBytes) ?: return false
+            val calculatedHex = computeSha1Hex(infoBytes)
+            val normalizedExpected = normalizeInfoHashToHex(expectedInfoHash)
+            return calculatedHex.equals(normalizedExpected, ignoreCase = true)
+        }
     }
 
     private val cancelFlags = ConcurrentHashMap<Long, AtomicBoolean>()
     private val pauseFlags = ConcurrentHashMap<Long, AtomicBoolean>()
+    private val activeJobs = ConcurrentHashMap<Long, Job>()
+    private val activeTokens = ConcurrentHashMap<Long, String>()
+
+    suspend fun cancelAndJoinTorrent(downloadId: Long) {
+        cancelFlags[downloadId]?.set(true)
+        val job = activeJobs.remove(downloadId)
+        job?.cancelAndJoin()
+    }
 
     fun startTorrentDownload(
         scope: CoroutineScope,
@@ -83,12 +292,14 @@ class TorrentEngine(
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
+        val runToken = java.util.UUID.randomUUID().toString()
+        activeTokens[item.id] = runToken
         val cancelFlag = AtomicBoolean(false)
         val pauseFlag = AtomicBoolean(false)
         cancelFlags[item.id] = cancelFlag
         pauseFlags[item.id] = pauseFlag
 
-        scope.launch(Dispatchers.IO) {
+        val job = scope.launch(Dispatchers.IO) {
             try {
                 performTorrentDownload(item, cancelFlag, pauseFlag, onProgress, onComplete, onError)
             } catch (e: Exception) {
@@ -97,10 +308,15 @@ class TorrentEngine(
                     onError("Torrent Error: ${e.localizedMessage ?: "Failed to resolve metadata"}")
                 }
             } finally {
-                cancelFlags.remove(item.id)
-                pauseFlags.remove(item.id)
+                if (activeTokens[item.id] == runToken) {
+                    activeTokens.remove(item.id)
+                    activeJobs.remove(item.id)
+                    cancelFlags.remove(item.id)
+                    pauseFlags.remove(item.id)
+                }
             }
         }
+        activeJobs[item.id] = job
     }
 
     fun pauseTorrent(downloadId: Long) {
@@ -135,7 +351,9 @@ class TorrentEngine(
             return@withContext
         }
 
+        // Label tracker counts as trackers
         store.updateTorrentStats(item.id, peers = metadata.trackers.size, seeds = 0)
+        Log.d(TAG, "Magnet ${metadata.infoHash} resolved with ${metadata.trackers.size} active trackers")
 
         // Attempt to fetch torrent dictionary from public web caches
         var torrentBytes: ByteArray? = null
@@ -151,7 +369,8 @@ class TorrentEngine(
                         torrentBytes = resp.body?.bytes()
                     }
                 }
-                if (torrentBytes != null && torrentBytes!!.isNotEmpty()) break
+                val currentBytes = torrentBytes
+                if (currentBytes != null && currentBytes.isNotEmpty()) break
             } catch (_: Exception) {}
         }
 
@@ -164,31 +383,34 @@ class TorrentEngine(
             return@withContext
         }
 
-        if (torrentBytes != null && torrentBytes!!.isNotEmpty()) {
+        val verifiedBytes = torrentBytes
+        if (verifiedBytes != null && verifiedBytes.isNotEmpty()) {
+            // Verify infohash against magnet infohash
+            val infoHashValid = verifyTorrentInfoHash(verifiedBytes, metadata.infoHash)
+            if (!infoHashValid) {
+                onError("Torrent infohash mismatch: metadata failed SHA-1 verification against ${metadata.infoHash}")
+                return@withContext
+            }
+
             // Save the resolved .torrent file so user has genuine file
             val torrentSaveFile = if (targetFile.name.endsWith(".torrent", ignoreCase = true)) {
                 targetFile
             } else {
                 File("${item.filePath}.torrent")
             }
-            torrentSaveFile.writeBytes(torrentBytes!!)
+            torrentSaveFile.writeBytes(verifiedBytes)
 
-            // Check if webseed URLs exist in the torrent for direct HTTP download
-            val webSeedUrl = extractWebSeedUrl(torrentBytes!!)
-            if (webSeedUrl != null) {
-                // Download real payload directly from HTTP WebSeed
-                downloadFromWebSeed(item, webSeedUrl, targetFile, cancelFlag, pauseFlag, onProgress, onComplete, onError)
-                return@withContext
-            }
+            // Disable unverified webseed downloads for cache-fetched metadata path
+            // to ensure no unverified payloads can be delivered. The verified .torrent is preserved.
 
-            // Successfully retrieved and verified .torrent metadata
+            // Metadata-only: set record name and filePath to the saved .torrent file
+            store.updateFileLocation(item.id, torrentSaveFile.name, torrentSaveFile.absolutePath)
             store.updateTotalSize(item.id, torrentSaveFile.length())
             store.updateProgress(item.id, torrentSaveFile.length(), 0L, DownloadStatus.COMPLETED, listOf(1.0f))
             store.markCompleted(item.id)
             onProgress(torrentSaveFile.length(), 0L, listOf(1.0f))
             onComplete()
         } else {
-            // Torrent not in web cache; genuine error message explaining metadata state
             val trackerCount = metadata.trackers.size
             onError("Metadata not found in public caches for infohash ${metadata.infoHash}. (Active trackers: $trackerCount). Direct P2P swarm required.")
         }
@@ -265,6 +487,10 @@ class TorrentEngine(
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
+        if (!webSeedUrl.startsWith("https://", ignoreCase = true)) {
+            onError("Rejected unverified/insecure non-HTTPS WebSeed URL: $webSeedUrl")
+            return
+        }
         try {
             val req = Request.Builder()
                 .url(webSeedUrl)
@@ -326,24 +552,5 @@ class TorrentEngine(
         } catch (e: Exception) {
             onError("WebSeed download error: ${e.message}")
         }
-    }
-
-    private fun extractWebSeedUrl(bytes: ByteArray): String? {
-        val str = String(bytes, Charsets.ISO_8859_1)
-        val idx = str.indexOf("8:url-list")
-        if (idx != -1) {
-            val sub = str.substring(idx + 10)
-            val httpIdx = sub.indexOf("http")
-            if (httpIdx != -1) {
-                val end = sub.indexOfAny(charArrayOf('e', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0'), httpIdx + 4)
-                if (end != -1) {
-                    val candidate = sub.substring(httpIdx, end).trim()
-                    if (candidate.startsWith("http://") || candidate.startsWith("https://")) {
-                        return candidate
-                    }
-                }
-            }
-        }
-        return null
     }
 }

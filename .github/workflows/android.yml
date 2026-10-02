@@ -3,15 +3,22 @@ name: Android CI/CD Release Pipeline
 on:
   push:
     branches: [ main, dev, alpha ]
+  pull_request:
+    branches: [ main, dev, alpha ]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    name: Build & Release Signed APK
+    name: Build & Verify APK
     runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.check_signing.outputs.should_publish }}
+      tag_name: ${{ steps.release_info.outputs.tag_name }}
+      release_name: ${{ steps.release_info.outputs.release_name }}
+      prerelease: ${{ steps.release_info.outputs.prerelease }}
 
     steps:
       - name: Checkout Source Code
@@ -26,56 +33,69 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Run Unit Tests and Lint
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug --no-daemon
+
+      - name: Check Signing Secrets Availability
+        id: check_signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+            echo "Signing secrets detected."
+          else
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+            echo "Signing secrets missing. Will build without publishing."
+          fi
+
       - name: Setup Keystore
+        if: steps.check_signing.outputs.should_publish == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           mkdir -p keystore
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > keystore/speeddown-release.jks
-          fi
-          # Fallback: if keystore is missing or 0-byte, generate a valid 2048-bit release key automatically
-          if [ ! -s keystore/speeddown-release.jks ]; then
-            echo "Generating automated release signing key..."
-            keytool -genkeypair -v \
-              -keystore keystore/speeddown-release.jks \
-              -alias speeddown \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -storepass speeddown123 \
-              -keypass speeddown123 \
-              -dname "CN=SpeedDown, OU=Mobile, O=SpeedDown, L=San Francisco, S=CA, C=US"
-          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > keystore/speeddown-release.jks
 
-      - name: Grant Execute Permission for Gradlew
-        run: chmod +x gradlew
-
-      - name: Build Signed Release APK
+      - name: Build Release APK
+        if: steps.check_signing.outputs.should_publish == 'true'
         env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'speeddown123' }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'speeddown' }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'speeddown123' }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease --no-daemon
 
+      - name: Build Debug APK (Validation when not publishing)
+        if: steps.check_signing.outputs.should_publish != 'true'
+        run: ./gradlew assembleDebug --no-daemon
+
       - name: Determine Release Tag and Channel
+        if: steps.check_signing.outputs.should_publish == 'true' && github.event_name != 'pull_request'
         id: release_info
         run: |
           REF_NAME="${{ github.ref_name }}"
           SHORT_SHA=$(git rev-parse --short HEAD)
-          DATE=$(date +'%Y%m%d')
+          RUN_NUM="${{ github.run_number }}"
+          VERSION_NAME=$(grep -o 'versionName = "[^"]*"' app/build.gradle.kts | head -n1 | cut -d'"' -f2)
+          if [ -z "$VERSION_NAME" ]; then VERSION_NAME="1.0"; fi
           
           if [ "$REF_NAME" = "main" ]; then
-            TAG_NAME="v1.0-${DATE}-${SHORT_SHA}"
-            RELEASE_NAME="SpeedDown Official Release ${TAG_NAME}"
+            TAG_NAME="v${VERSION_NAME}.${RUN_NUM}"
+            RELEASE_NAME="SpeedDown Release v${VERSION_NAME}.${RUN_NUM}"
             PRERELEASE=false
           elif [ "$REF_NAME" = "dev" ]; then
-            TAG_NAME="beta-${DATE}-${SHORT_SHA}"
-            RELEASE_NAME="SpeedDown Beta Build ${TAG_NAME}"
+            TAG_NAME="v${VERSION_NAME}-beta.${RUN_NUM}"
+            RELEASE_NAME="SpeedDown Beta v${VERSION_NAME}-beta.${RUN_NUM}"
             PRERELEASE=true
           else
-            TAG_NAME="alpha-${DATE}-${SHORT_SHA}"
-            RELEASE_NAME="SpeedDown Alpha Preview ${TAG_NAME}"
+            TAG_NAME="v${VERSION_NAME}-alpha.${RUN_NUM}"
+            RELEASE_NAME="SpeedDown Alpha v${VERSION_NAME}-alpha.${RUN_NUM}"
             PRERELEASE=true
           fi
           
@@ -84,6 +104,7 @@ jobs:
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
       - name: Organize Architecture Release APKs
+        if: steps.check_signing.outputs.should_publish == 'true' && github.event_name != 'pull_request'
         run: |
           mkdir -p release-apks
           for f in app/build/outputs/apk/release/*.apk; do
@@ -97,7 +118,7 @@ jobs:
           ls -lh release-apks
 
       - name: Generate Changelog and Architecture Guide
-        id: changelog
+        if: steps.check_signing.outputs.should_publish == 'true' && github.event_name != 'pull_request'
         run: |
           echo "### 🚀 SpeedDown Release Notes" > changelog.md
           echo "" >> changelog.md
@@ -116,14 +137,37 @@ jobs:
           echo "#### Recent Changes:" >> changelog.md
           git log -1 --pretty=format:"%s%n%n%b" >> changelog.md
 
+      - name: Upload Release Artifacts
+        if: steps.check_signing.outputs.should_publish == 'true' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apks
+          path: |
+            release-apks/*.apk
+            changelog.md
+
+  publish:
+    name: Publish Release
+    needs: build
+    if: needs.build.outputs.should_publish == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Release Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-apks
+          path: release-bundle
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_info.outputs.tag_name }}
-          name: ${{ steps.release_info.outputs.release_name }}
-          body_path: changelog.md
-          prerelease: ${{ steps.release_info.outputs.prerelease == 'true' }}
+          tag_name: ${{ needs.build.outputs.tag_name }}
+          name: ${{ needs.build.outputs.release_name }}
+          body_path: release-bundle/changelog.md
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
           files: |
-            release-apks/*.apk
+            release-bundle/release-apks/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

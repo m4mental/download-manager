@@ -49,17 +49,33 @@ object YouTubeExtractorEngine {
         }
     }
 
+    fun isValidYouTubeHost(host: String?): Boolean {
+        if (host.isNullOrBlank()) return false
+        val cleanHost = host.trim().lowercase()
+        return cleanHost == "youtube.com" ||
+                cleanHost.endsWith(".youtube.com") ||
+                cleanHost == "youtu.be" ||
+                cleanHost.endsWith(".youtu.be")
+    }
+
     fun isYouTubeUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
-        val clean = url.trim().lowercase()
-        return clean.contains("youtube.com/watch") ||
-                clean.contains("youtu.be/") ||
-                clean.contains("youtube.com/shorts/") ||
-                clean.contains("music.youtube.com/") ||
-                clean.contains("m.youtube.com/") ||
-                clean.contains("youtube.com/embed/") ||
-                clean.contains("youtube.com/live/") ||
-                clean.contains("youtube.com/v/")
+        val clean = url.trim()
+        val withScheme = if (!clean.contains("://")) "https://$clean" else clean
+        val host = try {
+            java.net.URI(withScheme).host
+        } catch (_: Exception) {
+            return false
+        }
+        return isValidYouTubeHost(host)
+    }
+
+    fun getVideoDeduplicationKey(resolution: String?, fps: Int, format: String?, codec: String?): String {
+        val cleanRes = Regex("\\d+p").find(resolution ?: "")?.value ?: (resolution ?: "unknown")
+        val cleanFmt = format?.uppercase() ?: "UNKNOWN"
+        val cleanCodec = codec?.lowercase() ?: ""
+        val fpsPart = if (fps > 0) "${fps}fps" else "default"
+        return "${cleanRes}_${fpsPart}_${cleanFmt}_$cleanCodec"
     }
 
     @Suppress("DEPRECATION")
@@ -77,6 +93,7 @@ object YouTubeExtractorEngine {
 
             val audioList = mutableListOf<YouTubeMediaStream>()
             val videoList = mutableListOf<YouTubeMediaStream>()
+            val seenVideoKeys = mutableSetOf<String>()
 
             // 1. Extract Audio Streams (Music / Podcast)
             streamInfo.audioStreams?.forEach { audio: AudioStream ->
@@ -96,7 +113,7 @@ object YouTubeExtractorEngine {
                         url = audio.content,
                         isAudioOnly = true,
                         itag = audio.itag,
-                        sizeBytes = 0L // Populated or calculated if needed
+                        sizeBytes = 0L
                     )
                 )
             }
@@ -111,25 +128,26 @@ object YouTubeExtractorEngine {
                 fmt == "WEBMA" || fmt == "OPUS" || fmt == "WEBMA_OPUS" || it.itag in listOf(251, 250, 249)
             }?.maxByOrNull { it.averageBitrate }
 
-            // Fallback audio if specific format isn't found
-            val fallbackAudio = bestM4aAudio ?: bestOpusAudio ?: streamInfo.audioStreams?.firstOrNull()
-
             // 2. Extract Combined Video Streams (Video + Audio already muxed by YouTube)
             streamInfo.videoStreams?.forEach { video: VideoStream ->
                 val res = video.resolution ?: "720p"
                 val formatName = video.format?.name?.uppercase() ?: "MP4"
-                videoList.add(
-                    YouTubeMediaStream(
-                        format = formatName,
-                        quality = "$res (Audio Included)",
-                        url = video.content,
-                        isAudioOnly = false,
-                        isVideoOnly = false,
-                        itag = video.itag,
-                        sizeBytes = 0L,
-                        audioUrl = null // Pre-muxed by YouTube
+                val fpsStr = if (video.fps > 30) " ${video.fps}fps" else ""
+                val dedupKey = getVideoDeduplicationKey(res, video.fps, formatName, video.codec)
+                if (seenVideoKeys.add(dedupKey)) {
+                    videoList.add(
+                        YouTubeMediaStream(
+                            format = formatName,
+                            quality = "$res$fpsStr (Audio Included)",
+                            url = video.content,
+                            isAudioOnly = false,
+                            isVideoOnly = false,
+                            itag = video.itag,
+                            sizeBytes = 0L,
+                            audioUrl = null // Pre-muxed by YouTube
+                        )
                     )
-                )
+                }
             }
 
             // 3. Extract High-Res Video Streams (1080p, 1440p, 4K) paired strictly with matching audio codec
@@ -140,10 +158,12 @@ object YouTubeExtractorEngine {
                 codec.startsWith("av01") || fmt.contains("av01") || video.itag in listOf(394, 395, 396, 397, 398, 399, 400, 401)
             }
 
-            // Sort: highest resolution first, then prefer MP4 (H.264) over WebM (VP9)
+            // Sort: highest resolution first, then highest fps, then prefer MP4 (H.264) over WebM (VP9)
             val sortedVideoOnly = validVideoOnly.sortedWith(
                 compareByDescending<VideoStream> {
                     Regex("\\d+").find(it.resolution ?: "")?.value?.toIntOrNull() ?: 0
+                }.thenByDescending {
+                    it.fps
                 }.thenByDescending {
                     val fmt = it.format?.name?.uppercase() ?: ""
                     fmt == "MP4" || fmt == "MPEG_4" || it.itag in listOf(137, 136, 135, 134, 133, 160)
@@ -156,33 +176,32 @@ object YouTubeExtractorEngine {
                             video.format?.name?.uppercase() == "MPEG_4" ||
                             video.itag in listOf(137, 136, 135, 134, 133, 160)
 
-                // CRITICAL FOR MEDIAMUXER:
-                // MP4 (H.264) video MUST be paired with M4A (AAC) audio!
-                // WebM (VP9) video MUST be paired with WebM (Opus) audio!
-                // Mixing them causes MediaMuxer.addTrack() to throw IllegalArgumentException.
-                val pairedAudio = if (isMp4) {
-                    bestM4aAudio ?: fallbackAudio
-                } else {
-                    bestOpusAudio ?: fallbackAudio
-                }
+                // CRITICAL FOR MEDIAMUXER & STRICT PAIRING:
+                // MP4 (H.264) video MUST be paired ONLY with M4A (AAC) audio!
+                // WebM (VP9) video MUST be paired ONLY with WebM (Opus) audio!
+                // Do NOT offer video-only option without compatible audio.
+                val pairedAudio = if (isMp4) bestM4aAudio else bestOpusAudio
+                if (pairedAudio != null) {
+                    val formatName = if (isMp4) "MP4" else "WEBM"
+                    val dedupKey = getVideoDeduplicationKey(res, video.fps, formatName, video.codec)
 
-                val formatName = if (isMp4) "MP4" else "WEBM"
-                val cleanRes = Regex("\\d+p").find(res)?.value ?: res
-
-                // Only add if this resolution hasn't been added yet (MP4 preferred over WebM)
-                if (cleanRes.isNotBlank() && videoList.none { it.quality.contains(cleanRes) } && pairedAudio != null) {
-                    videoList.add(
-                        YouTubeMediaStream(
-                            format = formatName,
-                            quality = "$cleanRes HD (Audio Included)",
-                            url = video.content,
-                            isAudioOnly = false,
-                            isVideoOnly = true,
-                            itag = video.itag,
-                            sizeBytes = 0L,
-                            audioUrl = pairedAudio.content
+                    // Preserve codec and frame-rate variants during deduplication
+                    if (seenVideoKeys.add(dedupKey)) {
+                        val cleanRes = Regex("\\d+p").find(res)?.value ?: res
+                        val fpsStr = if (video.fps > 30) " ${video.fps}fps" else ""
+                        videoList.add(
+                            YouTubeMediaStream(
+                                format = formatName,
+                                quality = "$cleanRes$fpsStr HD (Audio Included)",
+                                url = video.content,
+                                isAudioOnly = false,
+                                isVideoOnly = true,
+                                itag = video.itag,
+                                sizeBytes = 0L,
+                                audioUrl = pairedAudio.content
+                            )
                         )
-                    )
+                    }
                 }
             }
 
@@ -192,11 +211,16 @@ object YouTubeExtractorEngine {
                     .thenByDescending { it.quality }
             )
 
-            // Sort video: highest resolution first
-            val sortedVideo = videoList.sortedByDescending {
-                val num = Regex("\\d+").find(it.quality)?.value?.toIntOrNull() ?: 0
-                num
-            }
+            // Sort video: highest resolution first, then highest fps, then MP4 over WEBM
+            val sortedVideo = videoList.sortedWith(
+                compareByDescending<YouTubeMediaStream> {
+                    Regex("\\d+").find(it.quality)?.value?.toIntOrNull() ?: 0
+                }.thenByDescending {
+                    Regex("(\\d+)fps").find(it.quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                }.thenBy {
+                    if (it.format == "MP4") 0 else 1
+                }
+            )
 
             val bestThumbnail = streamInfo.thumbnails.maxByOrNull { it.width * it.height }?.url
                 ?: streamInfo.thumbnails.firstOrNull()?.url

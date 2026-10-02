@@ -140,6 +140,7 @@ object SecureDnsHelper {
                 }
 
                 // 1. Primary: Official OkHttp DNS-over-HTTPS (DoH)
+                // If user selected DoH, do not fall back to UDP or system DNS on error
                 if (dohResolver != null) {
                     try {
                         val addresses = dohResolver.lookup(hostname)
@@ -147,8 +148,11 @@ object SecureDnsHelper {
                             localDnsCache[cacheKey] = System.currentTimeMillis() to addresses
                             return addresses
                         }
+                        throw UnknownHostException("DoH returned no addresses for $hostname via $provider")
+                    } catch (e: UnknownHostException) {
+                        throw e
                     } catch (e: Exception) {
-                        Log.d(TAG, "DoH lookup failed for $hostname via $provider, attempting UDP fallback: ${e.message}")
+                        throw UnknownHostException("DoH lookup failed for $hostname via $provider: ${e.message}")
                     }
                 }
 
@@ -206,10 +210,14 @@ object SecureDnsHelper {
             val responsePacket = DatagramPacket(buffer, buffer.size)
             socket.receive(responsePacket)
 
-            parseDnsResponse(responsePacket.data, responsePacket.length, hostname)
+            parseDnsResponse(responsePacket.data, responsePacket.length, hostname, txId)
         } finally {
             socket.close()
         }
+    }
+
+    fun isValidDnsTransactionId(expectedTxId: Short, receivedTxId: Int): Boolean {
+        return (expectedTxId.toInt() and 0xFFFF) == (receivedTxId and 0xFFFF)
     }
 
     private fun buildDnsQuery(hostname: String, transactionId: Short): ByteArray {
@@ -237,9 +245,13 @@ object SecureDnsHelper {
         return baos.toByteArray()
     }
 
-    private fun parseDnsResponse(data: ByteArray, length: Int, hostname: String): List<InetAddress> {
+    private fun parseDnsResponse(data: ByteArray, length: Int, hostname: String, expectedTxId: Short): List<InetAddress> {
         val dis = DataInputStream(ByteArrayInputStream(data, 0, length))
-        dis.readUnsignedShort() // txId
+        val receivedTxId = dis.readUnsignedShort()
+        if (!isValidDnsTransactionId(expectedTxId, receivedTxId)) {
+            Log.w(TAG, "DNS transaction ID mismatch: expected ${expectedTxId.toInt() and 0xFFFF}, received $receivedTxId")
+            return emptyList()
+        }
         dis.readUnsignedShort() // flags
         val qdCount = dis.readUnsignedShort()
         val anCount = dis.readUnsignedShort()
@@ -307,7 +319,11 @@ object SecureDnsHelper {
             val address = InetAddress.getByName(target)
             val reachable = address.isReachable(2000)
             val elapsed = System.currentTimeMillis() - start
-            Pair(reachable || elapsed < 2000, elapsed)
+            if (reachable) {
+                Pair(true, elapsed)
+            } else {
+                Pair(false, -1L)
+            }
         } catch (_: Exception) {
             Pair(false, -1L)
         }

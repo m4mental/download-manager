@@ -37,4 +37,6 @@
 -keep class org.mozilla.classfile.ClassFileWriter
 -dontwarn org.mozilla.javascript.tools.**
 -dontwarn org.schabi.newpipe.extractor.**
+-dontwarn javax.script.**
+-dontwarn jdk.dynalink.**
 

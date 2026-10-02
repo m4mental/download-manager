@@ -52,6 +52,7 @@ private val Amber = Color(0xFFF59E0B)
 fun BrowserHomeScreen(
     settings: BrowserSettings,
     shortcuts: List<BrowserShortcut>,
+    isIncognito: Boolean = false,
     onNavigate: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onAddShortcut: (String, String) -> Unit,
@@ -226,6 +227,7 @@ fun BrowserHomeScreen(
                                 val shortcut = shortcuts[itemIndex]
                                 ShortcutItemView(
                                     shortcut = shortcut,
+                                    isIncognito = isIncognito,
                                     onClick = { onNavigate(shortcut.url) },
                                     onLongClick = { shortcutToDelete = shortcut },
                                     modifier = Modifier.weight(1f)
@@ -402,14 +404,15 @@ fun BrowserHomeScreen(
 @Composable
 private fun ShortcutItemView(
     shortcut: BrowserShortcut,
+    isIncognito: Boolean = false,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    var faviconBitmap by remember(shortcut.url) { mutableStateOf<android.graphics.Bitmap?>(null) }
-    LaunchedEffect(shortcut.url) {
-        faviconBitmap = FaviconLoader.getFavicon(context, shortcut.url)
+    var faviconBitmap by remember(shortcut.url, isIncognito) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(shortcut.url, isIncognito) {
+        faviconBitmap = FaviconLoader.getFavicon(context, shortcut.url, isIncognito = isIncognito)
     }
 
     val parsedColor = try {

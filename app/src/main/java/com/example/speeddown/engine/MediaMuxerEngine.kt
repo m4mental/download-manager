@@ -19,6 +19,23 @@ import java.nio.ByteBuffer
 object MediaMuxerEngine {
     private const val TAG = "MediaMuxerEngine"
     private const val DEFAULT_BUFFER_SIZE = 2 * 1024 * 1024 // 2 MB buffer
+    const val MAX_VIDEO_BUFFER_BUDGET = 32 * 1024 * 1024 // 32 MB max allocation budget for video
+    const val MAX_AUDIO_BUFFER_BUDGET = 8 * 1024 * 1024  // 8 MB max allocation budget for audio
+
+    /**
+     * Calculates the bounded buffer allocation size for a track based on the required sample size and default buffer size.
+     * Ensures that the required sample size fits within the allocation budget, returning a failure if it exceeds the budget
+     * rather than truncating below the required sample size.
+     */
+    internal fun calculateBufferSize(requiredSampleSize: Int, defaultSize: Int, budget: Int): Result<Int> {
+        if (requiredSampleSize > budget) {
+            return Result.failure(
+                IllegalArgumentException("Required sample size ($requiredSampleSize bytes) exceeds buffer allocation budget ($budget bytes)")
+            )
+        }
+        val size = maxOf(defaultSize, requiredSampleSize, requiredSampleSize * 2).coerceAtMost(budget)
+        return Result.success(size)
+    }
 
     /**
      * Muxes a video file and an audio file into an output file.
@@ -35,6 +52,7 @@ object MediaMuxerEngine {
         val videoExtractor = MediaExtractor()
         val audioExtractor = MediaExtractor()
         var muxer: MediaMuxer? = null
+        var muxerStopped = false
 
         try {
             videoExtractor.setDataSource(videoFile.absolutePath)
@@ -137,8 +155,23 @@ object MediaMuxerEngine {
                 audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
             } else 256 * 1024
 
-            val videoBufferSize = maxOf(DEFAULT_BUFFER_SIZE, videoMaxInput * 2)
-            val audioBufferSize = maxOf(512 * 1024, audioMaxInput * 2)
+            val videoBufferSizeResult = calculateBufferSize(videoMaxInput, DEFAULT_BUFFER_SIZE, MAX_VIDEO_BUFFER_BUDGET)
+            if (videoBufferSizeResult.isFailure) {
+                if (outputFile.exists()) {
+                    try { outputFile.delete() } catch (_: Exception) {}
+                }
+                return Result.failure(videoBufferSizeResult.exceptionOrNull() ?: IllegalStateException("Unsupported video sample size"))
+            }
+            val audioBufferSizeResult = calculateBufferSize(audioMaxInput, 512 * 1024, MAX_AUDIO_BUFFER_BUDGET)
+            if (audioBufferSizeResult.isFailure) {
+                if (outputFile.exists()) {
+                    try { outputFile.delete() } catch (_: Exception) {}
+                }
+                return Result.failure(audioBufferSizeResult.exceptionOrNull() ?: IllegalStateException("Unsupported audio sample size"))
+            }
+
+            val videoBufferSize = videoBufferSizeResult.getOrThrow()
+            val audioBufferSize = audioBufferSizeResult.getOrThrow()
 
             val videoBuffer = ByteBuffer.allocateDirect(videoBufferSize)
             val audioBuffer = ByteBuffer.allocateDirect(audioBufferSize)
@@ -148,6 +181,7 @@ object MediaMuxerEngine {
             var hasAudio = true
             var lastVideoTimeUs = -1L
             var lastAudioTimeUs = -1L
+            var muxerStopped = false
 
             // Strict timestamp interleaving to prevent buffer overflows and ensure monotonic presentation times
             while (hasVideo || hasAudio) {
@@ -191,17 +225,30 @@ object MediaMuxerEngine {
                 }
             }
 
+            // Select success only after muxer.stop() completes successfully
+            muxer.stop()
+            muxerStopped = true
+
             Log.d(TAG, "Muxing complete: ${outputFile.name} (size=${outputFile.length()} bytes)")
             return Result.success(outputFile)
         } catch (e: Exception) {
             Log.e(TAG, "Muxing failed: ${e.message}", e)
+            if (outputFile.exists()) {
+                try { outputFile.delete() } catch (_: Exception) {}
+            }
             return Result.failure(e)
         } finally {
+            if (!muxerStopped) {
+                try {
+                    muxer?.stop()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping MediaMuxer: ${e.message}")
+                }
+            }
             try {
-                muxer?.stop()
                 muxer?.release()
             } catch (e: Exception) {
-                Log.w(TAG, "Error closing MediaMuxer: ${e.message}")
+                Log.w(TAG, "Error releasing MediaMuxer: ${e.message}")
             }
             try { videoExtractor.release() } catch (_: Exception) {}
             try { audioExtractor.release() } catch (_: Exception) {}

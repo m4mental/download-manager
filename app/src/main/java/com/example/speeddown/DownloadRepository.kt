@@ -22,6 +22,56 @@ class DownloadRepository(private val context: Context) {
 
     suspend fun updateSettings(newSettings: DownloadSettings) = store.updateSettings(newSettings)
 
+    companion object {
+        fun generateUniqueFileName(
+            desiredName: String,
+            targetDir: File,
+            existingNames: Set<String>
+        ): String {
+            val dotIndex = desiredName.lastIndexOf('.')
+            val baseName = if (dotIndex > 0) desiredName.substring(0, dotIndex) else desiredName
+            val extension = if (dotIndex > 0) desiredName.substring(dotIndex) else ""
+
+            var candidate = desiredName
+            var counter = 1
+
+            while (
+                existingNames.contains(candidate.lowercase()) ||
+                File(targetDir, candidate).exists()
+            ) {
+                candidate = "$baseName ($counter)$extension"
+                counter++
+            }
+            return candidate
+        }
+
+        fun isExactNumberedPartFileName(name: String): Boolean {
+            return name.matches(Regex("^.+\\.part(\\d+)?$"))
+        }
+
+        fun isPathContainedInRoots(canonicalPath: String, allowedRoots: List<File>): Boolean {
+            val file = File(canonicalPath)
+            val canonicalFile = try { file.canonicalFile } catch (_: Exception) { file.absoluteFile }
+            return allowedRoots.any { root ->
+                val canonicalRoot = try { root.canonicalFile } catch (_: Exception) { root.absoluteFile }
+                canonicalFile.startsWith(canonicalRoot)
+            }
+        }
+
+        fun isProtectedPartFile(file: File, protectedFilePaths: Set<String>): Boolean {
+            val normPath = file.absolutePath.replace('\\', '/')
+            return protectedFilePaths.any { protectedPath ->
+                val normProtected = protectedPath.replace('\\', '/')
+                normPath == "$normProtected.part" ||
+                    normPath.matches(Regex("^\\Q$normProtected\\E\\.part\\d+$")) ||
+                    normPath == "$normProtected.video.tmp.part" ||
+                    normPath.matches(Regex("^\\Q$normProtected\\E\\.video\\.tmp\\.part\\d+$")) ||
+                    normPath == "$normProtected.audio.tmp.part" ||
+                    normPath.matches(Regex("^\\Q$normProtected\\E\\.audio\\.tmp\\.part\\d+$"))
+            }
+        }
+    }
+
     fun determineCategory(fileName: String): String {
         val ext = fileName.substringAfterLast(".", "").lowercase()
         return when (ext) {
@@ -76,11 +126,14 @@ class DownloadRepository(private val context: Context) {
         }
         if (!targetDir.exists()) targetDir.mkdirs()
 
-        val filePath = "${targetDir.absolutePath}/$sanitizedFileName"
+        // Reserve a unique destination filename on insert. Check store records and the filesystem.
+        val existingNames = store.getAllDownloads().map { it.fileName.lowercase() }.toSet()
+        val uniqueFileName = generateUniqueFileName(sanitizedFileName, targetDir, existingNames)
+        val filePath = "${targetDir.absolutePath}/$uniqueFileName"
 
         val item = DownloadItem(
             url = cleanUrl,
-            fileName = sanitizedFileName,
+            fileName = uniqueFileName,
             filePath = filePath,
             threads = effectiveThreads,
             status = DownloadStatus.QUEUED,
@@ -119,15 +172,13 @@ class DownloadRepository(private val context: Context) {
         startServiceAction(DownloadService.ACTION_RESUME, downloadId)
     }
 
-    fun streamInNothingPlayer(item: DownloadItem): Boolean {
+    suspend fun streamInNothingPlayer(item: DownloadItem): Boolean {
         val streamServer = com.example.speeddown.engine.LocalStreamServer.getInstance(store)
         val streamUrl = streamServer.getStreamUrl(item.id, item.fileName)
         val uri = Uri.parse(streamUrl)
         return try {
             val intent = Intent().apply {
                 setClassName("com.nothing.player", "com.nothing.player.ExoVideoPlayerActivity")
-                putExtra("path", streamUrl)
-                putExtra("video_path", streamUrl)
                 putExtra("title", item.fileName)
                 putExtra("video_title", item.fileName)
                 putExtra("contentUri", streamUrl)
@@ -175,7 +226,7 @@ class DownloadRepository(private val context: Context) {
             speedDownDir.walkTopDown().forEach { file ->
                 if (file.isFile) {
                     val len = file.length()
-                    if (file.name.contains(".part")) {
+                    if (isExactNumberedPartFileName(file.name)) {
                         partBytes += len
                     } else {
                         when (determineCategory(file.name)) {
@@ -197,12 +248,16 @@ class DownloadRepository(private val context: Context) {
         val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val speedDownDir = File(publicDir, "SpeedDown")
         var deletedCount = 0
-        val activeIds = store.getActiveDownloads().map { it.filePath }
+        // Protect DOWNLOADING, PAUSED, QUEUED, and FAILED records during orphan cleanup
+        val baseProtectedPaths = store.getProtectedFilePaths()
+        val protectedPaths = baseProtectedPaths.flatMap { path ->
+            listOf(path, "$path.video.tmp", "$path.audio.tmp")
+        }.toSet()
         if (speedDownDir.exists()) {
             speedDownDir.walkTopDown().forEach { file ->
-                if (file.isFile && file.name.contains(".part")) {
-                    val isActive = activeIds.any { file.absolutePath.startsWith(it) }
-                    if (!isActive) {
+                if (file.isFile && isExactNumberedPartFileName(file.name)) {
+                    val isProtected = isProtectedPartFile(file, protectedPaths)
+                    if (!isProtected) {
                         try {
                             if (file.delete()) deletedCount++
                         } catch (_: Exception) {}
@@ -265,40 +320,134 @@ class DownloadRepository(private val context: Context) {
             } else item
         } else item
 
+        // If resume changes the destination to app-external storage, move existing parts.
+        // If the move fails, restart cleanly.
+        if (correctedItem.filePath != item.filePath) {
+            val oldBase = item.filePath
+            val newBase = correctedItem.filePath
+            val oldTarget = File(oldBase)
+            val newTarget = File(newBase)
+            var moveSuccess = true
+            try {
+                newTarget.parentFile?.mkdirs()
+                if (oldTarget.exists()) {
+                    if (!oldTarget.renameTo(newTarget)) {
+                        oldTarget.copyTo(newTarget, overwrite = true)
+                        oldTarget.delete()
+                    }
+                }
+                val oldPart = File("$oldBase.part")
+                val newPart = File("$newBase.part")
+                if (oldPart.exists()) {
+                    if (!oldPart.renameTo(newPart)) {
+                        oldPart.copyTo(newPart, overwrite = true)
+                        oldPart.delete()
+                    }
+                }
+                val oldParent = oldTarget.parentFile
+                if (oldParent != null && oldParent.exists()) {
+                    val partFiles = oldParent.listFiles { f -> f.name.startsWith(oldTarget.name + ".part") } ?: emptyArray()
+                    for (pf in partFiles) {
+                        val suffix = pf.name.substringAfter(oldTarget.name)
+                        val newPf = File(newTarget.parentFile, "${newTarget.name}$suffix")
+                        if (!pf.renameTo(newPf)) {
+                            pf.copyTo(newPf, overwrite = true)
+                            pf.delete()
+                        }
+                    }
+                }
+                val oldHlsDir = File("${oldBase}_parts")
+                val newHlsDir = File("${newBase}_parts")
+                if (oldHlsDir.exists()) {
+                    if (!oldHlsDir.renameTo(newHlsDir)) {
+                        oldHlsDir.copyRecursively(newHlsDir, overwrite = true)
+                        oldHlsDir.deleteRecursively()
+                    }
+                }
+                val oldV = File("$oldBase.video.tmp")
+                val newV = File("$newBase.video.tmp")
+                if (oldV.exists()) {
+                    if (!oldV.renameTo(newV)) {
+                        oldV.copyTo(newV, overwrite = true)
+                        oldV.delete()
+                    }
+                }
+                val oldA = File("$oldBase.audio.tmp")
+                val newA = File("$newBase.audio.tmp")
+                if (oldA.exists()) {
+                    if (!oldA.renameTo(newA)) {
+                        oldA.copyTo(newA, overwrite = true)
+                        oldA.delete()
+                    }
+                }
+            } catch (_: Exception) {
+                moveSuccess = false
+            }
+
+            if (!moveSuccess) {
+                // Restart cleanly
+                try {
+                    newTarget.delete()
+                    File("$newBase.part").delete()
+                    newTarget.parentFile?.listFiles()?.forEach { f ->
+                        if (f.name.startsWith(newTarget.name + ".part")) f.delete()
+                    }
+                    File("${newBase}_parts").deleteRecursively()
+                    File("$newBase.video.tmp").delete()
+                    File("$newBase.audio.tmp").delete()
+                } catch (_: Exception) {}
+                store.updateProgress(correctedItem.id, 0L, 0L, DownloadStatus.DOWNLOADING, emptyList())
+            }
+        }
+
         store.upsert(correctedItem)
         store.updateStatus(correctedItem.id, DownloadStatus.DOWNLOADING)
         startServiceAction(DownloadService.ACTION_RESUME, correctedItem.id)
     }
 
-    /**
-     * Cancels download. Updates store immediately so UI updates with zero latency,
-     * and sends ACTION_CANCEL to the background service to cancel active or queued coroutines.
-     */
     suspend fun cancelDownload(item: DownloadItem) {
         store.updateStatus(item.id, DownloadStatus.CANCELLED)
         startServiceAction(DownloadService.ACTION_CANCEL, item.id)
     }
 
     suspend fun deleteDownload(item: DownloadItem, deleteFile: Boolean = true) {
-        // 1. Mark cancelled first so UI and coroutines immediately recognize termination
+        // 1. Mark cancelled first so UI immediately updates
         store.updateStatus(item.id, DownloadStatus.CANCELLED)
-        // 2. Send ACTION_CANCEL to DownloadService to terminate sockets and threads
+
+        // 2. Use cancel-and-join instead of arbitrary delay
+        com.example.speeddown.engine.MultiThreadDownloader.cancelAndJoin(item.id)
+        com.example.speeddown.engine.HlsDownloader.cancelAndJoin(item.id)
         startServiceAction(DownloadService.ACTION_CANCEL, item.id)
-        // 3. Brief delay to allow network threads to abort and release file streams
-        kotlinx.coroutines.delay(120)
-        // 4. Remove from store
+
+        // 3. Remove from store
         store.remove(item.id)
-        // 5. Delete partial chunk files and final file from disk
+
+        // 4. Delete target, HTTP parts, HLS _parts, .video.tmp, .audio.tmp, and .torrent sidecar
         if (deleteFile) {
             try {
                 val file = File(item.filePath)
                 if (file.exists()) file.delete()
-                for (i in 0..120) {
-                    val pf = File("${item.filePath}.part$i")
-                    if (pf.exists()) pf.delete()
+
+                val singlePart = File("${item.filePath}.part")
+                if (singlePart.exists()) singlePart.delete()
+
+                file.parentFile?.listFiles()?.forEach { f ->
+                    if (f.name.startsWith(file.name + ".part")) {
+                        f.delete()
+                    }
                 }
-                val sp = File("${item.filePath}.part")
-                if (sp.exists()) sp.delete()
+
+                val hlsDir = File("${item.filePath}_parts")
+                if (hlsDir.exists()) hlsDir.deleteRecursively()
+
+                val vTmp = File("${item.filePath}.video.tmp")
+                if (vTmp.exists()) vTmp.delete()
+
+                val aTmp = File("${item.filePath}.audio.tmp")
+                if (aTmp.exists()) aTmp.delete()
+
+                val torrentSidecar = File("${item.filePath}.torrent")
+                if (torrentSidecar.exists()) torrentSidecar.delete()
             } catch (_: Exception) {}
         }
     }
@@ -341,17 +490,26 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
-    private fun getShareableUri(file: File): Uri {
+    fun getAllowedDownloadRoots(): List<File> {
+        val roots = mutableListOf<File>()
+        val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (publicDir != null) roots.add(publicDir)
+        val appExtDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+        if (appExtDir != null) roots.add(appExtDir)
+        return roots
+    }
+
+    fun getShareableUri(file: File): Uri? {
+        val canonicalFile = try { file.canonicalFile } catch (_: Exception) { file.absoluteFile }
+        if (!isPathContainedInRoots(canonicalFile.path, getAllowedDownloadRoots())) {
+            return null
+        }
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                androidx.core.content.FileProvider.getUriForFile(
-                    context, "${context.packageName}.fileprovider", file
-                )
-            } else {
-                Uri.fromFile(file)
-            }
+            androidx.core.content.FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", canonicalFile
+            )
         } catch (_: Exception) {
-            Uri.fromFile(file)
+            null
         }
     }
 
@@ -359,7 +517,7 @@ class DownloadRepository(private val context: Context) {
         val file = File(item.filePath)
         if (!file.exists()) return false
 
-        val uri = getShareableUri(file)
+        val uri = getShareableUri(file) ?: return false
         val mime = try {
             context.contentResolver.getType(uri)
         } catch (_: Exception) { null } ?: when (item.category) {
@@ -371,8 +529,6 @@ class DownloadRepository(private val context: Context) {
         return try {
             val intent = Intent().apply {
                 setClassName("com.nothing.player", "com.nothing.player.ExoVideoPlayerActivity")
-                putExtra("path", item.filePath)
-                putExtra("video_path", item.filePath)
                 putExtra("title", item.fileName)
                 putExtra("video_title", item.fileName)
                 putExtra("contentUri", uri.toString())
@@ -383,14 +539,16 @@ class DownloadRepository(private val context: Context) {
             context.startActivity(intent)
             true
         } catch (e: Exception) {
-            // Fallback to launcher intent
             launchNothingPlayerApp()
         }
     }
 
     fun openFile(item: DownloadItem) {
         val file = File(item.filePath)
-        if (!file.exists()) return
+        if (!file.exists()) {
+            android.widget.Toast.makeText(context, "File does not exist", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
 
         // Smart route to Nothing Player if preferred and media type
         val snapshot = kotlinx.coroutines.runBlocking {
@@ -401,6 +559,10 @@ class DownloadRepository(private val context: Context) {
         }
 
         val uri = getShareableUri(file)
+        if (uri == null) {
+            android.widget.Toast.makeText(context, "Security error: File path not within allowed download directories", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
         val mime = try {
             context.contentResolver.getType(uri)
         } catch (_: Exception) { null } ?: "*/*"
@@ -410,7 +572,9 @@ class DownloadRepository(private val context: Context) {
                 setDataAndType(uri, mime)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             })
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            android.widget.Toast.makeText(context, "No app found to open this file", android.widget.Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun startServiceAction(action: String, downloadId: Long) {

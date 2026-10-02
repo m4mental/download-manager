@@ -34,6 +34,127 @@ class MultiThreadDownloader(
             "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
         const val YOUTUBE_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+        private val activeJobs = ConcurrentHashMap<Long, Job>()
+        private val activeOwnershipTokens = ConcurrentHashMap<Long, String>()
+        private val cancelFlags = ConcurrentHashMap<Long, AtomicBoolean>()
+        private val pauseFlags = ConcurrentHashMap<Long, AtomicBoolean>()
+        private val activeCalls = ConcurrentHashMap<Long, MutableList<okhttp3.Call>>()
+
+        suspend fun cancelAndJoin(downloadId: Long) {
+            cancelFlags[downloadId]?.set(true)
+            cancelOngoingCalls(downloadId)
+            val job = activeJobs[downloadId]
+            job?.cancel()
+            job?.join()
+            activeJobs.remove(downloadId, job)
+            activeOwnershipTokens.remove(downloadId)
+            cancelFlags.remove(downloadId)
+            pauseFlags.remove(downloadId)
+            activeCalls.remove(downloadId)
+        }
+
+        suspend fun pauseAndJoin(downloadId: Long) {
+            pauseFlags[downloadId]?.set(true)
+            cancelOngoingCalls(downloadId)
+            val job = activeJobs[downloadId]
+            job?.cancel()
+            job?.join()
+            activeJobs.remove(downloadId, job)
+            activeOwnershipTokens.remove(downloadId)
+            cancelFlags.remove(downloadId)
+            pauseFlags.remove(downloadId)
+            activeCalls.remove(downloadId)
+        }
+
+        fun cancelOngoingCalls(downloadId: Long) {
+            val calls = activeCalls[downloadId]?.toList()
+            calls?.forEach { call ->
+                try { call.cancel() } catch (_: Exception) {}
+            }
+            activeCalls.remove(downloadId)
+        }
+
+        data class ContentRangeInfo(val start: Long, val end: Long, val total: Long?)
+
+        fun parseContentRange(contentRange: String?): ContentRangeInfo? {
+            if (contentRange.isNullOrBlank()) return null
+            val match = Regex("""bytes\s+(\d+)-(\d+)/(\d+|\*)""", RegexOption.IGNORE_CASE).find(contentRange.trim())
+                ?: return null
+            val start = match.groupValues[1].toLongOrNull() ?: return null
+            val end = match.groupValues[2].toLongOrNull() ?: return null
+            val total = match.groupValues[3].toLongOrNull()
+            return ContentRangeInfo(start, end, total)
+        }
+
+        fun isValidContentRange(contentRange: String?, expectedStart: Long, expectedEnd: Long): Boolean {
+            val info = parseContentRange(contentRange) ?: return false
+            if (info.start != expectedStart) return false
+            if (expectedEnd > 0 && info.end != expectedEnd) return false
+            if (expectedEnd <= 0 && info.end < info.start) return false
+            return true
+        }
+
+        fun shouldRestartFromZeroOn200(useRange: Boolean, statusCode: Int): Boolean {
+            return useRange && statusCode == 200
+        }
+
+        fun isNumberedPartFileName(fileName: String, baseFileName: String): Boolean {
+            val escaped = Regex.escape(baseFileName)
+            return fileName.matches(Regex("""^$escaped\.part(\d+)?$"""))
+        }
+
+        fun shouldDiscardPartsAndRestart(
+            savedValidator: String?,
+            newValidator: String?,
+            savedLength: Long,
+            newLength: Long,
+            savedThreads: Int?,
+            newThreads: Int
+        ): Boolean {
+            if (!savedValidator.isNullOrBlank() && !newValidator.isNullOrBlank() && savedValidator != newValidator) {
+                return true
+            }
+            if (savedLength > 0 && newLength > 0 && savedLength != newLength) {
+                return true
+            }
+            if (savedThreads != null && savedThreads > 0 && newThreads > 0 && savedThreads != newThreads) {
+                return true
+            }
+            return false
+        }
+
+        fun selectRangeValidator(etag: String?, lastModified: String?): String? {
+            if (!etag.isNullOrBlank() && !etag.trim().startsWith("W/", ignoreCase = true)) {
+                return etag.trim()
+            }
+            return lastModified?.trim()?.takeIf { it.isNotBlank() }
+        }
+
+        fun publishSinglePart(partFile: File, targetFile: File): Boolean {
+            if (!partFile.exists()) return false
+            if (targetFile.exists()) {
+                targetFile.delete()
+            }
+            if (partFile.renameTo(targetFile)) {
+                return true
+            }
+            // Fallback: copy-and-delete
+            return try {
+                partFile.inputStream().use { input ->
+                    targetFile.outputStream().use { output ->
+                        input.copyTo(output, bufferSize = 65536)
+                    }
+                }
+                partFile.delete()
+                true
+            } catch (_: Exception) {
+                if (targetFile.exists()) {
+                    targetFile.delete()
+                }
+                false
+            }
+        }
     }
 
     private fun isYouTubeOrGoogleVideo(url: String?): Boolean {
@@ -42,11 +163,15 @@ class MultiThreadDownloader(
         return lower.contains("googlevideo.com") || lower.contains("youtube.com") || lower.contains("youtu.be")
     }
 
-    private val activeJobs = ConcurrentHashMap<Long, Job>()
-    private val cancelFlags = ConcurrentHashMap<Long, AtomicBoolean>()
-    private val pauseFlags = ConcurrentHashMap<Long, AtomicBoolean>()
-    private val activeCalls = ConcurrentHashMap<Long, MutableList<okhttp3.Call>>()
     private val downloadDispatcher = Dispatchers.IO.limitedParallelism(128)
+
+    suspend fun cancelAndJoinDownload(downloadId: Long) {
+        cancelAndJoin(downloadId)
+    }
+
+    suspend fun pauseAndJoinDownload(downloadId: Long) {
+        pauseAndJoin(downloadId)
+    }
 
     fun startDownload(
         scope: CoroutineScope,
@@ -56,21 +181,25 @@ class MultiThreadDownloader(
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
-        // Stop any running job and cancel ongoing calls for this download first
-        cancelOngoingCalls(item.id)
-        activeJobs.remove(item.id)?.cancel()
+        scope.launch(Dispatchers.IO) {
+            cancelAndJoin(item.id)
 
-        val cancelFlag = AtomicBoolean(false)
-        val pauseFlag = AtomicBoolean(false)
-        cancelFlags[item.id] = cancelFlag
-        pauseFlags[item.id] = pauseFlag
+            val ownershipToken = java.util.UUID.randomUUID().toString()
+            activeOwnershipTokens[item.id] = ownershipToken
 
-        var job: Job? = null
-        job = scope.launch(Dispatchers.IO) {
+            val cancelFlag = AtomicBoolean(false)
+            val pauseFlag = AtomicBoolean(false)
+            cancelFlags[item.id] = cancelFlag
+            pauseFlags[item.id] = pauseFlag
+
+            val job = coroutineContext[Job]
+            if (job != null) {
+                activeJobs[item.id] = job
+            }
+
             try {
                 performDownload(item, speedLimitKbps, cancelFlag, pauseFlag, onProgress, onComplete, onError)
             } catch (_: CancellationException) {
-                // Coroutine cancellation occurs normally on pause or restart.
                 Log.d(TAG, "Download ${item.id} coroutine stopped (paused=${pauseFlag.get()})")
                 if (pauseFlag.get()) {
                     store.updateStatus(item.id, DownloadStatus.PAUSED)
@@ -84,13 +213,16 @@ class MultiThreadDownloader(
                     onError(friendlyError)
                 }
             } finally {
-                job?.let { activeJobs.remove(item.id, it) }
-                cancelFlags.remove(item.id)
-                pauseFlags.remove(item.id)
-                activeCalls.remove(item.id)
+                // Remove tracking entries ONLY when ownership token matches
+                if (activeOwnershipTokens[item.id] == ownershipToken) {
+                    activeOwnershipTokens.remove(item.id)
+                    activeJobs.remove(item.id, job)
+                    cancelFlags.remove(item.id)
+                    pauseFlags.remove(item.id)
+                    activeCalls.remove(item.id)
+                }
             }
         }
-        activeJobs[item.id] = job
     }
 
     fun pauseDownload(downloadId: Long) {
@@ -117,13 +249,8 @@ class MultiThreadDownloader(
         activeJobs.remove(downloadId)
     }
 
-    private fun cancelOngoingCalls(downloadId: Long) {
-        val calls = activeCalls[downloadId]?.toList()
-        calls?.forEach { call ->
-            try { call.cancel() } catch (_: Exception) {}
-        }
-        activeCalls.remove(downloadId)
-    }
+    class RangedRequestReturned200Exception : IOException("Ranged request returned 200 OK - restarting single-threaded from zero")
+    class RangeNotSatisfiable416Exception : IOException("HTTP 416: Range Not Satisfiable")
 
     private suspend fun performDownload(
         item: DownloadItem,
@@ -153,33 +280,83 @@ class MultiThreadDownloader(
             val contentLength = probeResult.contentLength
             val acceptsRanges = probeResult.acceptsRanges
 
-            if (contentLength > 0) {
-                store.updateTotalSize(item.id, contentLength)
+            var threadCount = when {
+                isYouTubeOrGoogleVideo(item.url) -> 1
+                !acceptsRanges || contentLength <= 0 -> 1
+                contentLength < 1_000_000 -> 1
+                contentLength < 10_000_000 -> minOf(item.threads, 8)
+                else -> item.threads.coerceIn(1, 100)
             }
 
-            val success = downloadStreamInternal(
-                downloadId = item.id,
-                url = item.url,
-                filePath = item.filePath,
-                contentLength = contentLength,
-                acceptsRanges = acceptsRanges,
-                threads = item.threads,
-                speedLimitKbps = speedLimitKbps,
-                cancelFlag = cancelFlag,
-                pauseFlag = pauseFlag,
-                baseDownloaded = 0L,
-                totalSizeForProgress = contentLength,
-                onProgress = onProgress
+            store.updateTransferDetails(
+                id = item.id,
+                etag = probeResult.etag,
+                lastModified = probeResult.lastModified,
+                totalSize = contentLength,
+                actualThreads = threadCount
             )
 
+            if (shouldDiscardPartsAndRestart(
+                    savedValidator = item.etag ?: item.lastModified,
+                    newValidator = probeResult.etag ?: probeResult.lastModified,
+                    savedLength = item.totalSize,
+                    newLength = contentLength,
+                    savedThreads = item.actualThreads,
+                    newThreads = threadCount
+                )
+            ) {
+                Log.w(TAG, "Validator, length, or partition layout changed on resume for ${item.id}. Discarding parts.")
+                cleanupParts(item.filePath, item.actualThreads ?: item.threads)
+                if (targetFile.exists()) targetFile.delete()
+            }
+
+            var success = false
+            try {
+                success = downloadStreamInternal(
+                    downloadId = item.id,
+                    url = item.url,
+                    filePath = item.filePath,
+                    contentLength = contentLength,
+                    acceptsRanges = acceptsRanges,
+                    threads = threadCount,
+                    speedLimitKbps = speedLimitKbps,
+                    cancelFlag = cancelFlag,
+                    pauseFlag = pauseFlag,
+                    baseDownloaded = 0L,
+                    totalSizeForProgress = contentLength,
+                    validator = selectRangeValidator(probeResult.etag, probeResult.lastModified),
+                    onProgress = onProgress
+                )
+            } catch (_: RangedRequestReturned200Exception) {
+                Log.w(TAG, "Ranged request returned 200 OK for ${item.id}. Deleting all parts and restarting single-threaded from zero.")
+                cleanupParts(item.filePath, threadCount)
+                if (targetFile.exists()) targetFile.delete()
+                threadCount = 1
+                store.updateTransferDetails(
+                    id = item.id,
+                    etag = probeResult.etag,
+                    lastModified = probeResult.lastModified,
+                    totalSize = contentLength,
+                    actualThreads = 1
+                )
+                success = downloadStreamInternal(
+                    downloadId = item.id,
+                    url = item.url,
+                    filePath = item.filePath,
+                    contentLength = contentLength,
+                    acceptsRanges = false,
+                    threads = 1,
+                    speedLimitKbps = speedLimitKbps,
+                    cancelFlag = cancelFlag,
+                    pauseFlag = pauseFlag,
+                    baseDownloaded = 0L,
+                    totalSizeForProgress = contentLength,
+                    validator = null,
+                    onProgress = onProgress
+                )
+            }
+
             if (success && !cancelFlag.get() && !pauseFlag.get()) {
-                val threadCount = when {
-                    isYouTubeOrGoogleVideo(item.url) -> 1
-                    !acceptsRanges || contentLength <= 0 -> 1
-                    contentLength < 1_000_000 -> 1
-                    contentLength < 10_000_000 -> minOf(item.threads, 8)
-                    else -> item.threads.coerceIn(1, 100)
-                }
                 val completedParts = (0 until threadCount).map { 1f }
                 onProgress(contentLength.coerceAtLeast(targetFile.length()), 0L, completedParts)
                 onComplete()
@@ -214,20 +391,45 @@ class MultiThreadDownloader(
             // 1. Download Video Stream
             val isVideoDone = videoTempFile.exists() && (videoLength <= 0 || videoTempFile.length() >= videoLength)
             if (!isVideoDone) {
-                val videoSuccess = downloadStreamInternal(
-                    downloadId = item.id,
-                    url = item.url,
-                    filePath = videoTempPath,
-                    contentLength = videoLength,
-                    acceptsRanges = videoProbe.acceptsRanges,
-                    threads = item.threads,
-                    speedLimitKbps = speedLimitKbps,
-                    cancelFlag = cancelFlag,
-                    pauseFlag = pauseFlag,
-                    baseDownloaded = 0L,
-                    totalSizeForProgress = combinedTotal,
-                    onProgress = onProgress
-                )
+                var videoSuccess = false
+                var videoThreads = item.threads
+                try {
+                    videoSuccess = downloadStreamInternal(
+                        downloadId = item.id,
+                        url = item.url,
+                        filePath = videoTempPath,
+                        contentLength = videoLength,
+                        acceptsRanges = videoProbe.acceptsRanges,
+                        threads = videoThreads,
+                        speedLimitKbps = speedLimitKbps,
+                        cancelFlag = cancelFlag,
+                        pauseFlag = pauseFlag,
+                        baseDownloaded = 0L,
+                        totalSizeForProgress = combinedTotal,
+                        validator = selectRangeValidator(videoProbe.etag, videoProbe.lastModified),
+                        onProgress = onProgress
+                    )
+                } catch (_: RangedRequestReturned200Exception) {
+                    Log.w(TAG, "Video stream ranged request returned 200 OK. Restarting single-threaded.")
+                    cleanupParts(videoTempPath, videoThreads)
+                    if (videoTempFile.exists()) videoTempFile.delete()
+                    videoThreads = 1
+                    videoSuccess = downloadStreamInternal(
+                        downloadId = item.id,
+                        url = item.url,
+                        filePath = videoTempPath,
+                        contentLength = videoLength,
+                        acceptsRanges = false,
+                        threads = 1,
+                        speedLimitKbps = speedLimitKbps,
+                        cancelFlag = cancelFlag,
+                        pauseFlag = pauseFlag,
+                        baseDownloaded = 0L,
+                        totalSizeForProgress = combinedTotal,
+                        validator = null,
+                        onProgress = onProgress
+                    )
+                }
                 if (!videoSuccess || cancelFlag.get() || pauseFlag.get()) return
             }
 
@@ -235,21 +437,45 @@ class MultiThreadDownloader(
             val effectiveVideoBytes = if (videoLength > 0) videoLength else videoTempFile.length()
             val isAudioDone = audioTempFile.exists() && (audioLength <= 0 || audioTempFile.length() >= audioLength)
             if (!isAudioDone) {
-                val audioThreads = if (isYouTubeOrGoogleVideo(item.audioUrl)) 1 else minOf(item.threads, 4)
-                val audioSuccess = downloadStreamInternal(
-                    downloadId = item.id,
-                    url = item.audioUrl,
-                    filePath = audioTempPath,
-                    contentLength = audioLength,
-                    acceptsRanges = audioProbe.acceptsRanges,
-                    threads = audioThreads,
-                    speedLimitKbps = speedLimitKbps,
-                    cancelFlag = cancelFlag,
-                    pauseFlag = pauseFlag,
-                    baseDownloaded = effectiveVideoBytes,
-                    totalSizeForProgress = combinedTotal,
-                    onProgress = onProgress
-                )
+                var audioThreads = if (isYouTubeOrGoogleVideo(item.audioUrl)) 1 else minOf(item.threads, 4)
+                var audioSuccess = false
+                try {
+                    audioSuccess = downloadStreamInternal(
+                        downloadId = item.id,
+                        url = item.audioUrl,
+                        filePath = audioTempPath,
+                        contentLength = audioLength,
+                        acceptsRanges = audioProbe.acceptsRanges,
+                        threads = audioThreads,
+                        speedLimitKbps = speedLimitKbps,
+                        cancelFlag = cancelFlag,
+                        pauseFlag = pauseFlag,
+                        baseDownloaded = effectiveVideoBytes,
+                        totalSizeForProgress = combinedTotal,
+                        validator = selectRangeValidator(audioProbe.etag, audioProbe.lastModified),
+                        onProgress = onProgress
+                    )
+                } catch (_: RangedRequestReturned200Exception) {
+                    Log.w(TAG, "Audio stream ranged request returned 200 OK. Restarting single-threaded.")
+                    cleanupParts(audioTempPath, audioThreads)
+                    if (audioTempFile.exists()) audioTempFile.delete()
+                    audioThreads = 1
+                    audioSuccess = downloadStreamInternal(
+                        downloadId = item.id,
+                        url = item.audioUrl,
+                        filePath = audioTempPath,
+                        contentLength = audioLength,
+                        acceptsRanges = false,
+                        threads = 1,
+                        speedLimitKbps = speedLimitKbps,
+                        cancelFlag = cancelFlag,
+                        pauseFlag = pauseFlag,
+                        baseDownloaded = effectiveVideoBytes,
+                        totalSizeForProgress = combinedTotal,
+                        validator = null,
+                        onProgress = onProgress
+                    )
+                }
                 if (!audioSuccess || cancelFlag.get() || pauseFlag.get()) return
             }
 
@@ -267,6 +493,7 @@ class MultiThreadDownloader(
                 Log.d(TAG, "MediaMuxer successfully created ${targetFile.name} (${targetFile.length()} bytes)")
                 cleanupParts(videoTempPath, item.threads)
                 cleanupParts(audioTempPath, 4)
+                // Delete .video.tmp and .audio.tmp source files ONLY after mux success
                 try { videoTempFile.delete() } catch (_: Exception) {}
                 try { audioTempFile.delete() } catch (_: Exception) {}
                 onProgress(combinedTotal, 0L, listOf(1f))
@@ -294,6 +521,7 @@ class MultiThreadDownloader(
         pauseFlag: AtomicBoolean,
         baseDownloaded: Long = 0L,
         totalSizeForProgress: Long = -1L,
+        validator: String? = null,
         onProgress: (Long, Long, List<Float>) -> Unit
     ): Boolean {
         if (cancelFlag.get()) {
@@ -314,13 +542,12 @@ class MultiThreadDownloader(
 
         val chunkSize = if (contentLength > 0) contentLength / threadCount else 0L
 
-        // Track bytes per part for IDM-style live segmented visualizer
+        // Track bytes per part for live segmented visualizer
         val partProgressBytes = Array(threadCount) { i ->
             val pFile = getPartFile(filePath, i, threadCount)
             AtomicLong(if (acceptsRanges && pFile.exists()) pFile.length() else 0L)
         }
 
-        // Calculate already downloaded bytes from existing part files
         val initialBytes = if (acceptsRanges) {
             (0 until threadCount).sumOf { i ->
                 val pFile = getPartFile(filePath, i, threadCount)
@@ -336,7 +563,6 @@ class MultiThreadDownloader(
         var lastSpeedBytes = initialBytes
         var smoothedSpeed = 0L
 
-        // Speed & Progress Reporter with Exponential Moving Average (EMA) and Segment Tracking
         val progressJob = CoroutineScope(Dispatchers.IO).launch {
             while (isActive && !cancelFlag.get() && !pauseFlag.get()) {
                 delay(500)
@@ -346,7 +572,6 @@ class MultiThreadDownloader(
                 val bytesDelta = (currentStream - lastSpeedBytes).coerceAtLeast(0)
                 val instantSpeed = (bytesDelta * 1000L) / elapsed
 
-                // EMA smoothing (70% previous + 30% instant) for rock-solid speed & ETA
                 smoothedSpeed = if (smoothedSpeed == 0L) {
                     instantSpeed
                 } else {
@@ -390,7 +615,8 @@ class MultiThreadDownloader(
                             threadCount = threadCount,
                             cancelFlag = cancelFlag,
                             pauseFlag = pauseFlag,
-                            useRange = acceptsRanges && realEnd > 0
+                            useRange = acceptsRanges && realEnd > 0,
+                            validator = validator
                         )
                     }
                 }
@@ -424,7 +650,12 @@ class MultiThreadDownloader(
         return true
     }
 
-    private data class ProbeResult(val contentLength: Long, val acceptsRanges: Boolean)
+    private data class ProbeResult(
+        val contentLength: Long,
+        val acceptsRanges: Boolean,
+        val etag: String? = null,
+        val lastModified: String? = null
+    )
 
     private fun probeUrl(downloadId: Long, url: String, cancelFlag: AtomicBoolean): ProbeResult {
         if (cancelFlag.get()) return ProbeResult(-1L, false)
@@ -436,7 +667,7 @@ class MultiThreadDownloader(
         val isYt = isYouTubeOrGoogleVideo(url)
         val userAgent = if (isYt) YOUTUBE_USER_AGENT else BROWSER_USER_AGENT
 
-        // Step 1: Probe with GET Range: bytes=0-0 (Standard browser method for S3/R2 presigned URLs)
+        // Step 1: Probe with GET Range: bytes=0-0
         try {
             val rangeReqBuilder = Request.Builder()
                 .url(url)
@@ -457,15 +688,18 @@ class MultiThreadDownloader(
                 call.execute().use { response ->
                     callList.remove(call)
                     if (cancelFlag.get()) return ProbeResult(-1L, false)
+                    val etag = response.header("ETag")
+                    val lastModified = response.header("Last-Modified")
+
                     if (response.code == 206) {
                         val contentRange = response.header("Content-Range")
                         val totalFromRange = contentRange?.substringAfterLast("/")?.toLongOrNull() ?: -1L
                         val length = if (totalFromRange > 0) totalFromRange else (response.header("Content-Length")?.toLongOrNull() ?: -1L)
-                        return ProbeResult(length, acceptsRanges = true)
+                        return ProbeResult(length, acceptsRanges = true, etag = etag, lastModified = lastModified)
                     } else if (response.isSuccessful) {
                         val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
                         val ranges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
-                        return ProbeResult(length, acceptsRanges = ranges)
+                        return ProbeResult(length, acceptsRanges = ranges, etag = etag, lastModified = lastModified)
                     } else {
                         throw IOException("HTTP ${response.code}: ${getHttpErrorMessage(response.code)}")
                     }
@@ -505,7 +739,9 @@ class MultiThreadDownloader(
                 }
                 val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
                 val acceptsRanges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
-                return ProbeResult(length, acceptsRanges)
+                val etag = response.header("ETag")
+                val lastModified = response.header("Last-Modified")
+                return ProbeResult(length, acceptsRanges, etag = etag, lastModified = lastModified)
             }
         } catch (e: Exception) {
             callList.remove(getCall)
@@ -529,14 +765,20 @@ class MultiThreadDownloader(
                 if (f.exists()) f.delete()
             } catch (_: Exception) {}
         }
+        val singlePart = File("$filePath.part")
+        if (singlePart.exists()) {
+            try { singlePart.delete() } catch (_: Exception) {}
+        }
     }
 
     private fun mergeParts(targetFile: File, filePath: String, threadCount: Int) {
         if (threadCount == 1) {
             val singlePart = getPartFile(filePath, 0, 1)
             if (singlePart.exists()) {
-                if (targetFile.exists()) targetFile.delete()
-                singlePart.renameTo(targetFile)
+                val published = publishSinglePart(singlePart, targetFile)
+                if (!published) {
+                    throw IOException("Failed to publish single-part download to ${targetFile.name}")
+                }
             }
             return
         }
@@ -567,25 +809,25 @@ class MultiThreadDownloader(
         threadCount: Int,
         cancelFlag: AtomicBoolean,
         pauseFlag: AtomicBoolean,
-        useRange: Boolean
+        useRange: Boolean,
+        validator: String? = null
     ) {
-        val existingBytes = if (useRange && partFile.exists()) partFile.length() else 0L
         val isYt = isYouTubeOrGoogleVideo(url)
         val userAgent = if (isYt) YOUTUBE_USER_AGENT else BROWSER_USER_AGENT
+        val expectedLength = if (chunkEnd > 0) (chunkEnd - chunkStart + 1) else -1L
 
         val callList = activeCalls.computeIfAbsent(downloadId) {
             java.util.Collections.synchronizedList(mutableListOf())
         }
 
         var attempts = 0
-        val maxAttempts = 6 // Allow up to 6 reconnect attempts for continuous streams
+        val maxAttempts = 6
         while (attempts < maxAttempts && !cancelFlag.get() && !pauseFlag.get()) {
             attempts++
             val existingBytes = if (useRange && partFile.exists()) partFile.length() else 0L
             partProgressBytes.set(existingBytes)
 
-            // Check if this chunk is already finished
-            if (useRange && chunkEnd > 0 && chunkStart + existingBytes > chunkEnd) {
+            if (useRange && expectedLength > 0 && existingBytes >= expectedLength) {
                 return
             }
 
@@ -604,6 +846,12 @@ class MultiThreadDownloader(
             if (useRange && chunkStart >= 0) {
                 val rangeHeader = if (chunkEnd > 0) "bytes=$requestStart-$chunkEnd" else "bytes=$requestStart-"
                 requestBuilder.header("Range", rangeHeader)
+                val safeValidator = if (!validator.isNullOrBlank() && !validator.trim().startsWith("W/", ignoreCase = true)) {
+                    validator.trim()
+                } else null
+                if (!safeValidator.isNullOrBlank()) {
+                    requestBuilder.header("If-Range", safeValidator)
+                }
             }
 
             val call = okHttpClient.newCall(requestBuilder.build())
@@ -611,16 +859,46 @@ class MultiThreadDownloader(
 
             try {
                 val response = call.execute()
-                if (!response.isSuccessful && response.code != 206) {
-                    val code = response.code
+                val code = response.code
+
+                if (shouldRestartFromZeroOn200(useRange, code)) {
                     response.close()
-                    // If CDN throttles or temporarily returns 429/403, retry with backoff
+                    throw RangedRequestReturned200Exception()
+                }
+
+                if (code == 416) {
+                    response.close()
+                    Log.w(TAG, "HTTP 416 Range Not Satisfiable on part $chunkStart for download $downloadId. Resetting part.")
+                    if (partFile.exists()) partFile.delete()
+                    partProgressBytes.set(0L)
+                    if (attempts < maxAttempts) {
+                        delay(1000L)
+                        continue
+                    }
+                    throw RangeNotSatisfiable416Exception()
+                }
+
+                if (useRange && code != 206) {
+                    response.close()
                     if ((code == 429 || code == 403) && attempts < maxAttempts) {
                         Log.w(TAG, "Server responded with HTTP $code, retrying ($attempts/$maxAttempts) in ${attempts * 1500}ms...")
                         delay(attempts * 1500L)
                         continue
                     }
+                    throw IOException("HTTP $code: Expected 206 Partial Content but received $code")
+                }
+
+                if (!response.isSuccessful && code != 206) {
+                    response.close()
                     throw IOException("HTTP $code: ${getHttpErrorMessage(code)}")
+                }
+
+                if (code == 206) {
+                    val contentRange = response.header("Content-Range")
+                    if (!isValidContentRange(contentRange, requestStart, chunkEnd)) {
+                        response.close()
+                        throw IOException("HTTP 206 Content-Range mismatch: '$contentRange', expected start $requestStart, end $chunkEnd")
+                    }
                 }
 
                 val body = response.body ?: run {
@@ -628,15 +906,28 @@ class MultiThreadDownloader(
                     throw IOException("Empty response body from server")
                 }
 
-                val buffer = ByteArray(65536) // 64KB buffer for high speed
+                val buffer = ByteArray(65536)
                 FileOutputStream(partFile, useRange).use { fileOut ->
                     body.byteStream().use { stream ->
                         while (!cancelFlag.get() && !pauseFlag.get()) {
+                            val currentPartLen = partProgressBytes.get()
+                            val remainingExpected = if (expectedLength > 0) (expectedLength - currentPartLen) else Long.MAX_VALUE
+                            if (remainingExpected <= 0) break
+
                             val read = stream.read(buffer)
                             if (read == -1) break
-                            fileOut.write(buffer, 0, read)
-                            partProgressBytes.addAndGet(read.toLong())
-                            totalDownloaded.addAndGet(read.toLong())
+
+                            val maxToWrite = minOf(read.toLong(), remainingExpected).toInt()
+                            if (maxToWrite > 0) {
+                                fileOut.write(buffer, 0, maxToWrite)
+                                partProgressBytes.addAndGet(maxToWrite.toLong())
+                                totalDownloaded.addAndGet(maxToWrite.toLong())
+                            }
+
+                            if (read > maxToWrite) {
+                                throw IOException("Part oversized: received $read bytes exceeding remaining expected range $remainingExpected")
+                            }
+
                             if (speedLimitKbps > 0) {
                                 val perThreadBps = (speedLimitKbps * 1024L) / java.lang.Math.max(1, threadCount)
                                 val sleepMs = ((read.toDouble() / perThreadBps) * 1000.0).toLong()
@@ -649,11 +940,35 @@ class MultiThreadDownloader(
                     }
                 }
                 response.close()
-                // Successfully completed chunk
+
+                val finalPartLen = partFile.length()
+                if (expectedLength > 0) {
+                    if (finalPartLen > expectedLength) {
+                        partFile.delete()
+                        throw IOException("Part oversized: $finalPartLen exceeds expected $expectedLength")
+                    }
+                    if (finalPartLen < expectedLength) {
+                        if (!useRange) {
+                            totalDownloaded.addAndGet(-finalPartLen)
+                            partProgressBytes.set(0L)
+                        }
+                        if (attempts >= maxAttempts) {
+                            if (!cancelFlag.get() && !pauseFlag.get()) {
+                                throw IOException("Short part received: $finalPartLen of expected $expectedLength bytes after $maxAttempts attempts")
+                            }
+                            return
+                        }
+                        Log.w(TAG, "Short part received: $finalPartLen < $expectedLength. Retrying from offset...")
+                        continue
+                    }
+                }
                 return
             } catch (e: IOException) {
                 if (cancelFlag.get() || pauseFlag.get()) {
                     return
+                }
+                if (e is RangedRequestReturned200Exception || e is RangeNotSatisfiable416Exception) {
+                    throw e
                 }
                 val isConnectionDrop = e is SocketTimeoutException ||
                         e is ConnectException ||
@@ -674,6 +989,9 @@ class MultiThreadDownloader(
             } finally {
                 callList.remove(call)
             }
+        }
+        if (!cancelFlag.get() && !pauseFlag.get() && expectedLength > 0 && partFile.length() < expectedLength) {
+            throw IOException("Part incomplete: ${partFile.length()} of expected $expectedLength bytes after $attempts attempts")
         }
     }
 
@@ -709,3 +1027,4 @@ class MultiThreadDownloader(
         else -> "Server error ($code)"
     }
 }
+

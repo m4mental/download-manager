@@ -68,6 +68,7 @@ import com.example.speeddown.engine.GeckoTabSession
 import com.example.speeddown.engine.HlsStreamVariant
 import com.example.speeddown.engine.SecureDnsHelper
 import org.mozilla.geckoview.GeckoView
+import org.mozilla.geckoview.StorageController
 import com.example.speeddown.extractor.YouTubeExtractorEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -290,6 +291,12 @@ fun BrowserScreen(
         BrowserSessionManager.activeTabId = activeTabId
         BrowserSessionManager.saveSession(context)
     }
+
+    // Dynamic settings update for GeckoView runtime and active tab sessions
+    LaunchedEffect(browserSettings) {
+        GeckoEngine.updateRuntimeSettings(browserSettings)
+        tabs.forEach { it.geckoTabSession?.updateSettings(browserSettings) }
+    }
     val currentTab = tabs.find { it.id == activeTabId } ?: tabs.first()
     val coroutineScope = rememberCoroutineScope()
 
@@ -388,6 +395,24 @@ fun BrowserScreen(
             },
             onClearData = { clearCache, clearCookies, clearHistory, clearStorage ->
                 coroutineScope.launch(Dispatchers.Main) {
+                    var geckoFlags = 0L
+                    if (clearCache) {
+                        geckoFlags = geckoFlags or StorageController.ClearFlags.ALL_CACHES
+                    }
+                    if (clearCookies) {
+                        geckoFlags = geckoFlags or StorageController.ClearFlags.COOKIES or StorageController.ClearFlags.AUTH_SESSIONS
+                    }
+                    if (clearStorage) {
+                        geckoFlags = geckoFlags or StorageController.ClearFlags.DOM_STORAGES
+                    }
+                    if (clearCache && clearCookies && clearHistory && clearStorage) {
+                        geckoFlags = StorageController.ClearFlags.ALL
+                    }
+                    if (geckoFlags != 0L) {
+                        try {
+                            GeckoEngine.getOrCreateRuntime(context).storageController.clearData(geckoFlags)
+                        } catch (_: Exception) {}
+                    }
                     if (clearCookies) {
                         CookieManager.getInstance().removeAllCookies(null)
                         CookieManager.getInstance().flush()
@@ -1049,6 +1074,7 @@ fun BrowserScreen(
                 BrowserHomeScreen(
                     settings = browserSettings,
                     shortcuts = shortcuts,
+                    isIncognito = currentTab.isIncognito,
                     onNavigate = { targetUrl ->
                         var target = targetUrl.trim()
                         if (!target.startsWith("http://") && !target.startsWith("https://")) {
@@ -1135,6 +1161,7 @@ fun BrowserScreen(
                                     pendingDownload = PendingBrowserDownload(url, fileName, finalThreads)
                                 },
                                 defaultThreads = defaultThreads,
+                                browserSettings = browserSettings,
                                 onAdBlocked = {
                                     blockedCountState = AdBlockEngine.blockedAdsCount
                                 },
@@ -1390,12 +1417,12 @@ fun BrowserScreen(
                 ) {
                     Text("uBlock Origin", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                     Surface(
-                        color = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green.copy(alpha = 0.15f) else Color.Gray.copy(alpha = 0.15f),
+                        color = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green.copy(alpha = 0.15f) else if (GeckoEngine.installErrorMessage != null) MaterialTheme.colorScheme.error.copy(alpha = 0.15f) else Color.Gray.copy(alpha = 0.15f),
                         shape = RoundedCornerShape(6.dp)
                     ) {
                         Text(
-                            text = if (adBlockEnabled && GeckoEngine.isUBlockActive) "BUILT-IN ACTIVE" else if (adBlockEnabled) "INITIALIZING" else "PAUSED",
-                            color = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green else Color.Gray,
+                            text = if (adBlockEnabled && GeckoEngine.isUBlockActive) "BUILT-IN ACTIVE" else if (GeckoEngine.installErrorMessage != null) "ERROR" else if (adBlockEnabled) "INITIALIZING" else "PAUSED",
+                            color = if (adBlockEnabled && GeckoEngine.isUBlockActive) Green else if (GeckoEngine.installErrorMessage != null) MaterialTheme.colorScheme.error else Color.Gray,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -1423,8 +1450,30 @@ fun BrowserScreen(
                             onCheckedChange = {
                                 adBlockEnabled = it
                                 AdBlockEngine.isEnabled = it
+                                GeckoEngine.setUBlockEnabled(it)
                             }
                         )
+                    }
+
+                    if (GeckoEngine.installErrorMessage != null) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = "uBlock Status: ${GeckoEngine.installErrorMessage}",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                            }
+                        }
                     }
 
                     HorizontalDivider()

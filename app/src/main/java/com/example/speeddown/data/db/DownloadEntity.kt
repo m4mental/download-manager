@@ -29,7 +29,10 @@ data class DownloadEntity(
     val isHls: Boolean = false,
     val torrentPeers: Int = 0,
     val torrentSeeds: Int = 0,
-    val originalUrl: String? = null
+    val originalUrl: String? = null,
+    val etag: String? = null,
+    val lastModified: String? = null,
+    val actualThreads: Int? = null
 ) {
     fun toDownloadItem(): DownloadItem {
         val parts = if (partProgressCsv.isBlank()) emptyList()
@@ -57,7 +60,10 @@ data class DownloadEntity(
             isHls = isHls,
             torrentPeers = torrentPeers,
             torrentSeeds = torrentSeeds,
-            originalUrl = originalUrl
+            originalUrl = originalUrl,
+            etag = etag,
+            lastModified = lastModified,
+            actualThreads = actualThreads
         )
     }
 
@@ -83,7 +89,10 @@ data class DownloadEntity(
                 isHls = item.isHls,
                 torrentPeers = item.torrentPeers,
                 torrentSeeds = item.torrentSeeds,
-                originalUrl = item.originalUrl
+                originalUrl = item.originalUrl,
+                etag = item.etag,
+                lastModified = item.lastModified,
+                actualThreads = item.actualThreads
             )
         }
     }

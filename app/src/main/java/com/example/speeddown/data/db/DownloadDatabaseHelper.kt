@@ -7,8 +7,6 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.example.speeddown.data.DownloadItem
 import com.example.speeddown.data.DownloadStatus
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /**
  * High-performance SQLite database helper for SpeedDown.
@@ -20,7 +18,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
 
     companion object {
         const val DATABASE_NAME = "speeddown_downloads.db"
-        const val DATABASE_VERSION = 2
+        const val DATABASE_VERSION = 3
         const val TABLE_DOWNLOADS = "downloads"
 
         const val COL_ID = "id"
@@ -44,6 +42,9 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         const val COL_TORRENT_SEEDS = "torrentSeeds"
         const val COL_ORIGINAL_URL = "originalUrl"
         const val COL_AUDIO_URL = "audioUrl"
+        const val COL_ETAG = "etag"
+        const val COL_LAST_MODIFIED = "lastModified"
+        const val COL_ACTUAL_THREADS = "actualThreads"
 
         @Volatile
         private var instance: DownloadDatabaseHelper? = null
@@ -78,7 +79,10 @@ class DownloadDatabaseHelper private constructor(context: Context) :
                 $COL_TORRENT_PEERS INTEGER NOT NULL DEFAULT 0,
                 $COL_TORRENT_SEEDS INTEGER NOT NULL DEFAULT 0,
                 $COL_ORIGINAL_URL TEXT,
-                $COL_AUDIO_URL TEXT
+                $COL_AUDIO_URL TEXT,
+                $COL_ETAG TEXT,
+                $COL_LAST_MODIFIED TEXT,
+                $COL_ACTUAL_THREADS INTEGER
             );
         """.trimIndent()
         db.execSQL(createSql)
@@ -93,9 +97,20 @@ class DownloadDatabaseHelper private constructor(context: Context) :
                 db.execSQL("ALTER TABLE $TABLE_DOWNLOADS ADD COLUMN $COL_AUDIO_URL TEXT;")
             } catch (_: Exception) {}
         }
+        if (oldVersion < 3) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE_DOWNLOADS ADD COLUMN $COL_ETAG TEXT;")
+            } catch (_: Exception) {}
+            try {
+                db.execSQL("ALTER TABLE $TABLE_DOWNLOADS ADD COLUMN $COL_LAST_MODIFIED TEXT;")
+            } catch (_: Exception) {}
+            try {
+                db.execSQL("ALTER TABLE $TABLE_DOWNLOADS ADD COLUMN $COL_ACTUAL_THREADS INTEGER;")
+            } catch (_: Exception) {}
+        }
     }
 
-    suspend fun getAllDownloads(): List<DownloadItem> = withContext(Dispatchers.IO) {
+    suspend fun getAllDownloads(): List<DownloadItem> {
         val list = mutableListOf<DownloadItem>()
         val db = readableDatabase
         val cursor = db.query(
@@ -112,10 +127,10 @@ class DownloadDatabaseHelper private constructor(context: Context) :
                 list.add(cursorToDownloadItem(it))
             }
         }
-        list
+        return list
     }
 
-    suspend fun getDownloadById(id: Long): DownloadItem? = withContext(Dispatchers.IO) {
+    suspend fun getDownloadById(id: Long): DownloadItem? {
         val db = readableDatabase
         val cursor = db.query(
             TABLE_DOWNLOADS,
@@ -126,12 +141,12 @@ class DownloadDatabaseHelper private constructor(context: Context) :
             null,
             null
         )
-        cursor.use {
+        return cursor.use {
             if (it.moveToFirst()) cursorToDownloadItem(it) else null
         }
     }
 
-    suspend fun upsertDownload(item: DownloadItem) = withContext(Dispatchers.IO) {
+    suspend fun upsertDownload(item: DownloadItem) {
         val db = writableDatabase
         val values = downloadItemToContentValues(item)
         db.insertWithOnConflict(TABLE_DOWNLOADS, null, values, SQLiteDatabase.CONFLICT_REPLACE)
@@ -143,7 +158,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         speed: Long,
         status: DownloadStatus,
         partProgress: List<Float>
-    ) = withContext(Dispatchers.IO) {
+    ) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_DOWNLOADED_SIZE, downloaded)
@@ -161,7 +176,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         )
     }
 
-    suspend fun updateStatus(id: Long, status: DownloadStatus) = withContext(Dispatchers.IO) {
+    suspend fun updateStatus(id: Long, status: DownloadStatus) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_STATUS, status.name)
@@ -170,7 +185,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun updateTotalSize(id: Long, totalSize: Long) = withContext(Dispatchers.IO) {
+    suspend fun updateTotalSize(id: Long, totalSize: Long) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_TOTAL_SIZE, totalSize)
@@ -178,7 +193,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun updateError(id: Long, status: DownloadStatus, error: String) = withContext(Dispatchers.IO) {
+    suspend fun updateError(id: Long, status: DownloadStatus, error: String) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_STATUS, status.name)
@@ -188,7 +203,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun markCompleted(id: Long) = withContext(Dispatchers.IO) {
+    suspend fun markCompleted(id: Long) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_STATUS, DownloadStatus.COMPLETED.name)
@@ -198,9 +213,9 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun updateUrl(id: Long, newUrl: String) = withContext(Dispatchers.IO) {
+    suspend fun updateUrl(id: Long, newUrl: String) {
         val db = writableDatabase
-        val item = getDownloadById(id) ?: return@withContext
+        val item = getDownloadById(id) ?: return
         val values = ContentValues().apply {
             put(COL_ORIGINAL_URL, item.originalUrl ?: item.url)
             put(COL_URL, newUrl)
@@ -209,7 +224,7 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun updateTorrentStats(id: Long, peers: Int, seeds: Int) = withContext(Dispatchers.IO) {
+    suspend fun updateTorrentStats(id: Long, peers: Int, seeds: Int) {
         val db = writableDatabase
         val values = ContentValues().apply {
             put(COL_TORRENT_PEERS, peers)
@@ -218,14 +233,67 @@ class DownloadDatabaseHelper private constructor(context: Context) :
         db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun deleteDownload(id: Long) = withContext(Dispatchers.IO) {
+    suspend fun updateFileLocation(id: Long, fileName: String, filePath: String) {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put(COL_FILE_NAME, fileName)
+            put(COL_FILE_PATH, filePath)
+        }
+        db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
+    }
+
+    suspend fun deleteDownload(id: Long) {
         val db = writableDatabase
         db.delete(TABLE_DOWNLOADS, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
-    suspend fun clearByStatus(status: DownloadStatus) = withContext(Dispatchers.IO) {
+    suspend fun clearByStatus(status: DownloadStatus) {
         val db = writableDatabase
-        db.delete(TABLE_DOWNLOADS, "$COL_STATUS = ?", arrayOf(status.name))
+        db.beginTransaction()
+        try {
+            db.delete(TABLE_DOWNLOADS, "$COL_STATUS = ?", arrayOf(status.name))
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    suspend fun resetStaleDownloadingToPaused(): Int {
+        val db = writableDatabase
+        db.beginTransaction()
+        return try {
+            val values = ContentValues().apply {
+                put(COL_STATUS, DownloadStatus.PAUSED.name)
+                put(COL_SPEED, 0L)
+            }
+            val count = db.update(
+                TABLE_DOWNLOADS,
+                values,
+                "$COL_STATUS = ?",
+                arrayOf(DownloadStatus.DOWNLOADING.name)
+            )
+            db.setTransactionSuccessful()
+            count
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    suspend fun updateTransferDetails(
+        id: Long,
+        etag: String?,
+        lastModified: String?,
+        totalSize: Long,
+        actualThreads: Int
+    ) {
+        val db = writableDatabase
+        val values = ContentValues().apply {
+            put(COL_ETAG, etag)
+            put(COL_LAST_MODIFIED, lastModified)
+            put(COL_TOTAL_SIZE, totalSize)
+            put(COL_ACTUAL_THREADS, actualThreads)
+        }
+        db.update(TABLE_DOWNLOADS, values, "$COL_ID = ?", arrayOf(id.toString()))
     }
 
     private fun cursorToDownloadItem(c: Cursor): DownloadItem {
@@ -261,6 +329,18 @@ class DownloadDatabaseHelper private constructor(context: Context) :
             audioUrl = runCatching {
                 val idx = c.getColumnIndex(COL_AUDIO_URL)
                 if (idx >= 0 && !c.isNull(idx)) c.getString(idx) else null
+            }.getOrNull(),
+            etag = runCatching {
+                val idx = c.getColumnIndex(COL_ETAG)
+                if (idx >= 0 && !c.isNull(idx)) c.getString(idx) else null
+            }.getOrNull(),
+            lastModified = runCatching {
+                val idx = c.getColumnIndex(COL_LAST_MODIFIED)
+                if (idx >= 0 && !c.isNull(idx)) c.getString(idx) else null
+            }.getOrNull(),
+            actualThreads = runCatching {
+                val idx = c.getColumnIndex(COL_ACTUAL_THREADS)
+                if (idx >= 0 && !c.isNull(idx)) c.getInt(idx) else null
             }.getOrNull()
         )
     }
@@ -288,6 +368,9 @@ class DownloadDatabaseHelper private constructor(context: Context) :
             put(COL_TORRENT_SEEDS, item.torrentSeeds)
             put(COL_ORIGINAL_URL, item.originalUrl)
             put(COL_AUDIO_URL, item.audioUrl)
+            put(COL_ETAG, item.etag)
+            put(COL_LAST_MODIFIED, item.lastModified)
+            put(COL_ACTUAL_THREADS, item.actualThreads)
         }
     }
 }

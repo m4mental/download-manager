@@ -184,7 +184,12 @@ fun YouTubeDownloadBottomSheet(
                                 .replace(Regex("[\\\\/:*?\"<>|]"), "_")
                                 .trim()
                                 .ifBlank { "youtube_${System.currentTimeMillis()}" }
-                            val fullFileName = "$cleanTitle.$ext"
+                            val cleanQuality = stream.quality
+                                .replace(Regex("(?i)\\s*\\(Audio Included\\)"), "")
+                                .replace(Regex("[\\\\/:*?\"<>|]"), "")
+                                .trim()
+                            val tag = if (cleanQuality.isNotBlank()) " ($cleanQuality)" else " (${stream.format})"
+                            val fullFileName = "$cleanTitle$tag.$ext"
 
                             val defaultThreads = viewModel.settings.value.defaultThreads
                             val audioUrl = if (!isAudio) stream.audioUrl else null

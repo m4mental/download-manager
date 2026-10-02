@@ -28,7 +28,10 @@ data class DownloadItem(
     val torrentPeers: Int = 0,
     val torrentSeeds: Int = 0,
     val originalUrl: String? = null,
-    val audioUrl: String? = null
+    val audioUrl: String? = null,
+    val etag: String? = null,
+    val lastModified: String? = null,
+    val actualThreads: Int? = null
 ) {
     val progress: Float
         get() = if (totalSize > 0) (downloadedSize.toFloat() / totalSize.toFloat()) else 0f

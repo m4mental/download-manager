@@ -927,7 +927,7 @@ fun DownloadCard(
                         }
                         if (item.isTorrent) {
                             Surface(color = Blue.copy(0.15f), shape = RoundedCornerShape(4.dp)) {
-                                Text("🧲 S:${item.torrentSeeds} P:${item.torrentPeers}", color = Blue, fontSize = 10.sp,
+                                Text("🧲 S:${item.torrentSeeds} Trackers:${item.torrentPeers}", color = Blue, fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
                             }

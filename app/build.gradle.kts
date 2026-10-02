@@ -15,7 +15,8 @@ android {
         applicationId = "com.example.speeddown"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
+        val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
+        versionCode = ciRunNumber ?: 1
         versionName = "1.0"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -33,12 +34,15 @@ android {
 
     signingConfigs {
         create("release") {
+            val ksPassword = System.getenv("KEYSTORE_PASSWORD")
+            val kAlias = System.getenv("KEY_ALIAS")
+            val kPassword = System.getenv("KEY_PASSWORD")
             val ksFile = rootProject.file("keystore/speeddown-release.jks")
-            if (ksFile.exists() && ksFile.length() > 0L) {
+            if (!ksPassword.isNullOrBlank() && !kAlias.isNullOrBlank() && !kPassword.isNullOrBlank() && ksFile.exists() && ksFile.length() > 0L) {
                 storeFile = ksFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "speeddown123"
-                keyAlias = System.getenv("KEY_ALIAS") ?: "speeddown"
-                keyPassword = System.getenv("KEY_PASSWORD") ?: "speeddown123"
+                storePassword = ksPassword
+                keyAlias = kAlias
+                keyPassword = kPassword
             }
         }
     }
@@ -54,10 +58,7 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {
-            val releaseConfig = signingConfigs.getByName("release")
-            if (releaseConfig.storeFile != null) {
-                signingConfig = releaseConfig
-            }
+            // Use default debug signing for debug builds, not the release key
         }
     }
     compileOptions {
@@ -93,7 +94,6 @@ kotlin {
 dependencies {
   val composeBom = platform(libs.androidx.compose.bom)
   implementation(composeBom)
-  androidTestImplementation(composeBom)
 
   // Core Android dependencies
   implementation(libs.androidx.core.ktx)
@@ -116,16 +116,14 @@ dependencies {
 
   // Instrumented tests
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
-
-  // Local tests
-  testImplementation(libs.junit)
-  testImplementation(libs.kotlinx.coroutines.test)
-
-  // Instrumented tests
   androidTestImplementation(libs.androidx.test.core)
   androidTestImplementation(libs.androidx.test.ext.junit)
   androidTestImplementation(libs.androidx.test.runner)
   androidTestImplementation(libs.androidx.test.espresso.core)
+
+  // Local tests
+  testImplementation(libs.junit)
+  testImplementation(libs.kotlinx.coroutines.test)
 
   // Navigation
   implementation(libs.androidx.navigation3.ui)

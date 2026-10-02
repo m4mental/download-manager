@@ -20,6 +20,7 @@ class LocalStreamServer private constructor(
     companion object {
         private const val TAG = "LocalStreamServer"
         const val DEFAULT_PORT = 8998
+        const val MAX_CONCURRENT_STREAMS = 4
 
         @Volatile
         private var instance: LocalStreamServer? = null
@@ -29,12 +30,61 @@ class LocalStreamServer private constructor(
                 instance ?: LocalStreamServer(store).also { instance = it }
             }
         }
+
+        data class HttpRange(val start: Long, val end: Long)
+
+        fun parseHttpRange(rangeHeader: String?, totalSize: Long): Result<HttpRange?> {
+            if (rangeHeader.isNullOrBlank()) return Result.success(null)
+            if (!rangeHeader.startsWith("bytes=")) return Result.failure(IllegalArgumentException("Invalid Range header format"))
+
+            val rangeVal = rangeHeader.removePrefix("bytes=").trim()
+            val dashIdx = rangeVal.indexOf('-')
+            if (dashIdx < 0) return Result.failure(IllegalArgumentException("Missing dash in Range header"))
+
+            val startStr = rangeVal.substring(0, dashIdx).trim()
+            val endStr = rangeVal.substring(dashIdx + 1).trim()
+
+            if (startStr.isEmpty() && endStr.isEmpty()) {
+                return Result.failure(IllegalArgumentException("Empty range"))
+            }
+
+            if (startStr.isEmpty()) {
+                // Suffix range: bytes=-N (final N bytes)
+                val suffixLen = endStr.toLongOrNull() ?: return Result.failure(IllegalArgumentException("Invalid suffix length"))
+                if (suffixLen <= 0) return Result.failure(IllegalArgumentException("Suffix length must be positive"))
+                if (totalSize <= 0) return Result.failure(IndexOutOfBoundsException("Cannot satisfy suffix range on 0-sized file"))
+                val start = (totalSize - suffixLen).coerceAtLeast(0L)
+                val end = totalSize - 1
+                return Result.success(HttpRange(start, end))
+            }
+
+            val start = startStr.toLongOrNull() ?: return Result.failure(IllegalArgumentException("Invalid start offset"))
+            val end = if (endStr.isNotEmpty()) {
+                endStr.toLongOrNull() ?: return Result.failure(IllegalArgumentException("Invalid end offset"))
+            } else {
+                if (totalSize > 0) totalSize - 1 else Long.MAX_VALUE
+            }
+
+            if (totalSize > 0) {
+                if (start >= totalSize || start > end) {
+                    return Result.failure(IndexOutOfBoundsException("Range not satisfiable: $start-$end for totalSize $totalSize"))
+                }
+                val clampedEnd = end.coerceAtMost(totalSize - 1)
+                return Result.success(HttpRange(start, clampedEnd))
+            } else {
+                if (start > end) return Result.failure(IndexOutOfBoundsException("Range not satisfiable"))
+                return Result.success(HttpRange(start, end))
+            }
+        }
     }
 
     private var serverSocket: ServerSocket? = null
     private val isRunning = AtomicBoolean(false)
     private var serverJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var sessionToken: String = java.util.UUID.randomUUID().toString()
+    private var bindDeferred: CompletableDeferred<Int>? = null
+    private val connectionSemaphore = kotlinx.coroutines.sync.Semaphore(MAX_CONCURRENT_STREAMS)
 
     val port: Int
         get() = serverSocket?.localPort ?: DEFAULT_PORT
@@ -42,15 +92,21 @@ class LocalStreamServer private constructor(
     fun start() {
         if (isRunning.getAndSet(true)) return
 
+        val deferred = CompletableDeferred<Int>()
+        bindDeferred = deferred
+        sessionToken = java.util.UUID.randomUUID().toString()
+
         serverJob = scope.launch {
             try {
-                // Try preferred port or bind to any available free port
+                val loopback = java.net.InetAddress.getByName("127.0.0.1")
                 serverSocket = try {
-                    ServerSocket(DEFAULT_PORT)
+                    ServerSocket(DEFAULT_PORT, 50, loopback)
                 } catch (_: Exception) {
-                    ServerSocket(0)
+                    ServerSocket(0, 50, loopback)
                 }
-                Log.d(TAG, "LocalStreamServer started on port ${serverSocket?.localPort}")
+                val boundPort = serverSocket!!.localPort
+                deferred.complete(boundPort)
+                Log.d(TAG, "LocalStreamServer started on 127.0.0.1:$boundPort with token $sessionToken")
 
                 while (isActive && isRunning.get()) {
                     try {
@@ -65,6 +121,7 @@ class LocalStreamServer private constructor(
                     }
                 }
             } catch (e: Exception) {
+                deferred.completeExceptionally(e)
                 Log.e(TAG, "LocalStreamServer startup failed", e)
             } finally {
                 isRunning.set(false)
@@ -78,21 +135,35 @@ class LocalStreamServer private constructor(
             serverSocket?.close()
         } catch (_: Exception) {}
         serverJob?.cancel()
+        bindDeferred?.cancel(CancellationException("LocalStreamServer stopped"))
         serverSocket = null
+        bindDeferred = null
         Log.d(TAG, "LocalStreamServer stopped")
     }
 
-    fun getStreamUrl(downloadId: Long, fileName: String = "video.mp4"): String {
+    suspend fun getStreamUrl(downloadId: Long, fileName: String = "video.mp4"): String {
         start()
+        val actualPort = try {
+            bindDeferred?.await() ?: port
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            port
+        }
         val safeName = fileName.replace(" ", "%20")
-        return "http://127.0.0.1:$port/stream/$downloadId/$safeName"
+        return "http://127.0.0.1:$actualPort/stream/$sessionToken/$downloadId/$safeName"
     }
 
     private suspend fun handleClient(client: Socket) = withContext(Dispatchers.IO) {
+        val rawOutput = client.getOutputStream()
+        if (!connectionSemaphore.tryAcquire()) {
+            sendError(rawOutput, 503, "Service Unavailable: Stream connection limit reached")
+            try { client.close() } catch (_: Exception) {}
+            return@withContext
+        }
         try {
             client.soTimeout = 30000
             val input = BufferedReader(InputStreamReader(client.getInputStream()))
-            val rawOutput = client.getOutputStream()
 
             val requestLine = input.readLine() ?: return@withContext
             Log.d(TAG, "Stream Request: $requestLine")
@@ -113,14 +184,22 @@ class LocalStreamServer private constructor(
                 line = input.readLine()
             }
 
-            val path = parts[1] // /stream/{id}/{fileName}
+            // Expected path: /stream/{sessionToken}/{downloadId}/{fileName}
+            val path = parts[1]
             val segments = path.split("/").filter { it.isNotBlank() }
-            if (segments.size < 2 || segments[0] != "stream") {
+            if (segments.size < 3 || segments[0] != "stream") {
                 sendError(rawOutput, 404, "Not Found")
                 return@withContext
             }
 
-            val downloadId = segments[1].toLongOrNull()
+            val requestToken = segments[1]
+            if (requestToken != sessionToken) {
+                Log.w(TAG, "Stream rejected: Invalid token $requestToken (expected $sessionToken)")
+                sendError(rawOutput, 403, "Forbidden: Invalid or missing stream session token")
+                return@withContext
+            }
+
+            val downloadId = segments[2].toLongOrNull()
             if (downloadId == null) {
                 sendError(rawOutput, 400, "Invalid Download ID")
                 return@withContext
@@ -136,6 +215,7 @@ class LocalStreamServer private constructor(
         } catch (e: Exception) {
             Log.w(TAG, "Client streaming disconnected: ${e.message}")
         } finally {
+            connectionSemaphore.release()
             try { client.close() } catch (_: Exception) {}
         }
     }
@@ -201,22 +281,27 @@ class LocalStreamServer private constructor(
         }
 
         val mimeType = getMimeType(item.fileName)
-        var startByte = 0L
-        var endByte = totalSize - 1
 
-        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
-            val rangeVal = rangeHeader.removePrefix("bytes=").trim()
-            val dashIdx = rangeVal.indexOf('-')
-            if (dashIdx >= 0) {
-                val startStr = rangeVal.substring(0, dashIdx).trim()
-                val endStr = rangeVal.substring(dashIdx + 1).trim()
-                if (startStr.isNotBlank()) startByte = startStr.toLongOrNull() ?: 0L
-                if (endStr.isNotBlank()) endByte = (endStr.toLongOrNull() ?: (totalSize - 1)).coerceAtMost(totalSize - 1)
+        val rangeResult = parseHttpRange(rangeHeader, totalSize)
+        if (rangeResult.isFailure) {
+            val exception = rangeResult.exceptionOrNull()
+            if (exception is IndexOutOfBoundsException) {
+                val h = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$totalSize\r\nContent-Length: 0\r\n\r\n"
+                output.write(h.toByteArray(Charsets.UTF_8))
+                output.flush()
+                return
+            } else {
+                sendError(output, 400, "Bad Request: Invalid Range")
+                return
             }
         }
 
+        val httpRange = rangeResult.getOrNull()
+        val isPartial = httpRange != null
+        val startByte = httpRange?.start ?: 0L
+        val endByte = httpRange?.end ?: (totalSize - 1)
+
         val contentLength = (endByte - startByte + 1).coerceAtLeast(0L)
-        val isPartial = rangeHeader != null
 
         val responseHeader = buildString {
             append(if (isPartial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
@@ -237,7 +322,7 @@ class LocalStreamServer private constructor(
         // Stream data bytes with multi-part virtual file resolution and live polling
         val buffer = ByteArray(64 * 1024)
         var currentOffset = startByte
-        val threadCount = item.threads.coerceAtLeast(1)
+        val threadCount = (item.actualThreads ?: item.threads).coerceAtLeast(1)
         val chunkSize = if (threadCount > 1 && totalSize > 0) totalSize / threadCount else 0L
 
         try {

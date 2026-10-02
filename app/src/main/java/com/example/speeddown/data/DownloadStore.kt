@@ -96,14 +96,18 @@ class DownloadStore private constructor(private val context: Context) {
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val dbDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     private val isLoaded = CompletableDeferred<Unit>()
 
     private val _downloadsState = MutableStateFlow<List<DownloadItem>>(emptyList())
     val allDownloads: Flow<List<DownloadItem>> = _downloadsState.asStateFlow()
 
     init {
-        scope.launch {
+        scope.launch(dbDispatcher) {
             try {
+                // Change stale DOWNLOADING rows to PAUSED before publishing state
+                dbHelper.resetStaleDownloadingToPaused()
+
                 // 1. Load from high-performance SQLite Database
                 var items = dbHelper.getAllDownloads()
 
@@ -155,6 +159,21 @@ class DownloadStore private constructor(private val context: Context) {
         return _downloadsState.value.filter { it.status == DownloadStatus.DOWNLOADING }
     }
 
+    fun getAllDownloads(): List<DownloadItem> = _downloadsState.value
+
+    fun getProtectedDownloads(): List<DownloadItem> {
+        return _downloadsState.value.filter {
+            it.status == DownloadStatus.DOWNLOADING ||
+            it.status == DownloadStatus.PAUSED ||
+            it.status == DownloadStatus.QUEUED ||
+            it.status == DownloadStatus.FAILED
+        }
+    }
+
+    fun getProtectedFilePaths(): Set<String> {
+        return getProtectedDownloads().map { it.filePath }.toSet()
+    }
+
     suspend fun upsert(item: DownloadItem) {
         ensureLoaded()
         _downloadsState.update { current ->
@@ -163,7 +182,7 @@ class DownloadStore private constructor(private val context: Context) {
             if (idx >= 0) list[idx] = item else list.add(0, item)
             list
         }
-        scope.launch { dbHelper.upsertDownload(item) }
+        scope.launch(dbDispatcher) { dbHelper.upsertDownload(item) }
     }
 
     suspend fun remove(id: Long) {
@@ -171,7 +190,7 @@ class DownloadStore private constructor(private val context: Context) {
         _downloadsState.update { current ->
             current.filterNot { it.id == id }
         }
-        scope.launch { dbHelper.deleteDownload(id) }
+        scope.launch(dbDispatcher) { dbHelper.deleteDownload(id) }
     }
 
     suspend fun clearByStatus(status: DownloadStatus) {
@@ -179,7 +198,7 @@ class DownloadStore private constructor(private val context: Context) {
         _downloadsState.update { current ->
             current.filterNot { it.status == status }
         }
-        scope.launch { dbHelper.clearByStatus(status) }
+        scope.launch(dbDispatcher) { dbHelper.clearByStatus(status) }
     }
 
     suspend fun updateStatus(id: Long, status: DownloadStatus) {
@@ -189,7 +208,7 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(status = status, speed = 0L) else it
             }
         }
-        scope.launch { dbHelper.updateStatus(id, status) }
+        scope.launch(dbDispatcher) { dbHelper.updateStatus(id, status) }
     }
 
     suspend fun updateProgress(
@@ -220,8 +239,8 @@ class DownloadStore private constructor(private val context: Context) {
             }
         }
 
-        // Direct atomic update to SQLite row without JSON serialization
-        scope.launch {
+        // Direct atomic update to SQLite row via sequential single-threaded dispatcher
+        scope.launch(dbDispatcher) {
             dbHelper.updateProgress(id, downloaded, speed, status, partProgress)
         }
     }
@@ -233,7 +252,30 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(totalSize = totalSize) else it
             }
         }
-        scope.launch { dbHelper.updateTotalSize(id, totalSize) }
+        scope.launch(dbDispatcher) { dbHelper.updateTotalSize(id, totalSize) }
+    }
+
+    suspend fun updateTransferDetails(
+        id: Long,
+        etag: String?,
+        lastModified: String?,
+        totalSize: Long,
+        actualThreads: Int
+    ) {
+        ensureLoaded()
+        _downloadsState.update { current ->
+            current.map {
+                if (it.id == id) it.copy(
+                    etag = etag,
+                    lastModified = lastModified,
+                    totalSize = totalSize,
+                    actualThreads = actualThreads
+                ) else it
+            }
+        }
+        scope.launch(dbDispatcher) {
+            dbHelper.updateTransferDetails(id, etag, lastModified, totalSize, actualThreads)
+        }
     }
 
     suspend fun updateError(id: Long, status: DownloadStatus, error: String) {
@@ -243,7 +285,7 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(status = status, errorMessage = error, speed = 0L) else it
             }
         }
-        scope.launch { dbHelper.updateError(id, status, error) }
+        scope.launch(dbDispatcher) { dbHelper.updateError(id, status, error) }
     }
 
     suspend fun markCompleted(id: Long) {
@@ -257,7 +299,7 @@ class DownloadStore private constructor(private val context: Context) {
                 ) else it
             }
         }
-        scope.launch { dbHelper.markCompleted(id) }
+        scope.launch(dbDispatcher) { dbHelper.markCompleted(id) }
     }
 
     suspend fun updateUrl(id: Long, newUrl: String) {
@@ -271,7 +313,7 @@ class DownloadStore private constructor(private val context: Context) {
                 ) else it
             }
         }
-        scope.launch { dbHelper.updateUrl(id, newUrl) }
+        scope.launch(dbDispatcher) { dbHelper.updateUrl(id, newUrl) }
     }
 
     suspend fun updateTorrentStats(id: Long, peers: Int, seeds: Int) {
@@ -281,6 +323,16 @@ class DownloadStore private constructor(private val context: Context) {
                 if (it.id == id) it.copy(torrentPeers = peers, torrentSeeds = seeds) else it
             }
         }
-        scope.launch { dbHelper.updateTorrentStats(id, peers, seeds) }
+        scope.launch(dbDispatcher) { dbHelper.updateTorrentStats(id, peers, seeds) }
+    }
+
+    suspend fun updateFileLocation(id: Long, fileName: String, filePath: String) {
+        ensureLoaded()
+        _downloadsState.update { current ->
+            current.map {
+                if (it.id == id) it.copy(fileName = fileName, filePath = filePath) else it
+            }
+        }
+        scope.launch(dbDispatcher) { dbHelper.updateFileLocation(id, fileName, filePath) }
     }
 }
