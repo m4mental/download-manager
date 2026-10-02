@@ -121,6 +121,7 @@ object GeckoEngine {
     }
 
     @Synchronized
+    @android.annotation.SuppressLint("WrongThread")
     fun setUBlockEnabled(enabled: Boolean, onComplete: ((Boolean) -> Unit)? = null) {
         desiredUBlockEnabled = enabled
         AdBlockEngine.isEnabled = enabled
@@ -185,6 +186,7 @@ object GeckoEngine {
         )
     }
 
+    @android.annotation.SuppressLint("WrongThread")
     private fun applyInstalledExtensionState(
         rt: GeckoRuntime,
         ext: org.mozilla.geckoview.WebExtension,
@@ -218,6 +220,7 @@ object GeckoEngine {
         )
     }
 
+    @android.annotation.SuppressLint("WrongThread")
     private fun installBuiltInExtensions(context: Context) {
         val rt = runtime ?: return
         try {

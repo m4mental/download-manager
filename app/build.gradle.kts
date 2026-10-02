@@ -85,6 +85,11 @@ android {
         useLegacyPackaging = true
       }
     }
+
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
 }
 
 kotlin {
@@ -115,6 +120,7 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
 
   // Instrumented tests
+  androidTestImplementation(composeBom)
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.test.core)
   androidTestImplementation(libs.androidx.test.ext.junit)

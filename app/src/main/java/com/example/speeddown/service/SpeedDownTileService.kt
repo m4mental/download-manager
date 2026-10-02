@@ -12,11 +12,14 @@ class SpeedDownTileService : TileService() {
         qsTile?.apply {
             state = Tile.STATE_ACTIVE
             label = "SpeedDown"
-            subtitle = "New Download"
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                subtitle = "New Download"
+            }
             updateTile()
         }
     }
 
+    @android.annotation.SuppressLint("StartActivityAndCollapseDeprecated")
     override fun onClick() {
         super.onClick()
         val intent = Intent(this, MainActivity::class.java).apply {

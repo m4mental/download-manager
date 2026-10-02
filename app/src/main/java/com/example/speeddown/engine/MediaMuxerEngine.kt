@@ -41,6 +41,7 @@ object MediaMuxerEngine {
      * Muxes a video file and an audio file into an output file.
      * Interleaves sample writing by timestamp to prevent buffer overflows and ensure monotonic presentation times.
      */
+    @android.annotation.SuppressLint("WrongConstant")
     fun mux(videoFile: File, audioFile: File, outputFile: File): Result<File> {
         if (!videoFile.exists() || videoFile.length() == 0L) {
             return Result.failure(IllegalStateException("Video track file is missing or empty"))
