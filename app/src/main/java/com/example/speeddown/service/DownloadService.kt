@@ -305,9 +305,10 @@ class DownloadService : Service() {
                         return@launch
                     }
                     store.updateProgress(downloadId, downloaded, speed, DownloadStatus.DOWNLOADING, parts)
+                    val safeDownloaded = maxOf(currentItem.downloadedSize, downloaded)
                     val total = currentItem.totalSize
                     val name = currentItem.fileName
-                    updateNotification(downloadId, name, total, downloaded, speed)
+                    updateNotification(downloadId, name, total, safeDownloaded, speed)
                 }
             }
 
@@ -416,7 +417,13 @@ class DownloadService : Service() {
     private fun updateNotification(downloadId: Long, name: String, total: Long, downloaded: Long, speed: Long) {
         val progress = if (total > 0) ((downloaded * 100) / total).toInt() else 0
         val speedStr = formatSpeed(speed)
-        val text = if (total > 0) "$progress% • $speedStr" else "$speedStr downloaded"
+        val etaSeconds = if (speed > 0 && total > downloaded) (total - downloaded) / speed else -1L
+        val etaStr = if (etaSeconds >= 0) com.example.speeddown.ui.components.formatEta(etaSeconds) else ""
+        val text = when {
+            total > 0 && etaStr.isNotEmpty() && etaStr != "--" -> "$progress% • $speedStr • $etaStr left"
+            total > 0 -> "$progress% • $speedStr"
+            else -> "$speedStr downloaded"
+        }
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIFICATION_ID, buildNotification(downloadId, name, text, progress, total, ongoing = true))
     }

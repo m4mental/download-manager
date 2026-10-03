@@ -344,6 +344,7 @@ class MultiThreadDownloader(
                 cleanupParts(item.filePath, threadCount)
                 if (targetFile.exists()) targetFile.delete()
                 threadCount = 1
+                store.updateProgress(item.id, 0L, 0L, DownloadStatus.DOWNLOADING, emptyList(), forceReset = true)
                 store.updateTransferDetails(
                     id = item.id,
                     etag = probeResult.etag,
@@ -426,6 +427,7 @@ class MultiThreadDownloader(
                     cleanupParts(videoTempPath, videoThreads)
                     if (videoTempFile.exists()) videoTempFile.delete()
                     videoThreads = 1
+                    store.updateProgress(item.id, 0L, 0L, DownloadStatus.DOWNLOADING, emptyList(), forceReset = true)
                     videoSuccess = downloadStreamInternal(
                         downloadId = item.id,
                         url = item.url,
@@ -472,6 +474,7 @@ class MultiThreadDownloader(
                     cleanupParts(audioTempPath, audioThreads)
                     if (audioTempFile.exists()) audioTempFile.delete()
                     audioThreads = 1
+                    store.updateProgress(item.id, effectiveVideoBytes, 0L, DownloadStatus.DOWNLOADING, emptyList(), forceReset = true)
                     audioSuccess = downloadStreamInternal(
                         downloadId = item.id,
                         url = item.audioUrl,
@@ -574,6 +577,7 @@ class MultiThreadDownloader(
         var lastSpeedCheck = System.currentTimeMillis()
         var lastSpeedBytes = initialBytes
         var smoothedSpeed = 0L
+        val maxReported = AtomicLong(baseDownloaded + initialBytes)
 
         val progressJob = CoroutineScope(Dispatchers.IO).launch {
             while (isActive && !cancelFlag.get() && !pauseFlag.get()) {
@@ -600,7 +604,9 @@ class MultiThreadDownloader(
                     }
                 } else emptyList()
 
-                val reportedTotal = baseDownloaded + currentStream
+                val rawTotal = baseDownloaded + currentStream
+                val safeTotal = maxReported.updateAndGet { prev -> maxOf(prev, rawTotal) }
+                val reportedTotal = if (contentLength > 0) minOf(safeTotal, contentLength) else safeTotal
                 onProgress(reportedTotal, smoothedSpeed.coerceAtLeast(0L), parts)
             }
         }

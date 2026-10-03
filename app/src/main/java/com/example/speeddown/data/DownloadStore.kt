@@ -216,8 +216,11 @@ class DownloadStore private constructor(private val context: Context) {
         downloaded: Long,
         speed: Long,
         status: DownloadStatus,
-        partProgress: List<Float> = emptyList()
+        partProgress: List<Float> = emptyList(),
+        forceReset: Boolean = false
     ) {
+        var finalDownloaded = downloaded
+        var finalPartProgress = partProgress
         _downloadsState.update { current ->
             current.map {
                 if (it.id == id) {
@@ -226,13 +229,32 @@ class DownloadStore private constructor(private val context: Context) {
                         it.status == DownloadStatus.COMPLETED ||
                         it.status == DownloadStatus.FAILED
                     ) {
+                        finalDownloaded = downloaded
                         it.copy(downloadedSize = downloaded, speed = 0L)
                     } else {
+                        // Monotonic progress guarantee: downloadedSize and progress should NEVER drop backwards
+                        // during active DOWNLOADING due to out-of-order coroutine callbacks or temporary chunk retries.
+                        finalDownloaded = if (forceReset) {
+                            downloaded
+                        } else {
+                            maxOf(it.downloadedSize, downloaded)
+                        }
+
+                        val effectivePartProgress = if (partProgress.isNotEmpty()) {
+                            if (it.isHls && it.partProgress.isNotEmpty()) {
+                                val maxProg = maxOf(it.partProgress.first(), partProgress.first())
+                                listOf(maxProg)
+                            } else {
+                                partProgress
+                            }
+                        } else it.partProgress
+                        finalPartProgress = effectivePartProgress
+
                         it.copy(
-                            downloadedSize = downloaded,
+                            downloadedSize = finalDownloaded,
                             speed = speed,
                             status = status,
-                            partProgress = if (partProgress.isNotEmpty()) partProgress else it.partProgress
+                            partProgress = effectivePartProgress
                         )
                     }
                 } else it
@@ -241,7 +263,7 @@ class DownloadStore private constructor(private val context: Context) {
 
         // Direct atomic update to SQLite row via sequential single-threaded dispatcher
         scope.launch(dbDispatcher) {
-            dbHelper.updateProgress(id, downloaded, speed, status, partProgress)
+            dbHelper.updateProgress(id, finalDownloaded, speed, status, finalPartProgress)
         }
     }
 
@@ -249,7 +271,12 @@ class DownloadStore private constructor(private val context: Context) {
         ensureLoaded()
         _downloadsState.update { current ->
             current.map {
-                if (it.id == id) it.copy(totalSize = totalSize) else it
+                if (it.id == id) {
+                    val safeTotal = if (totalSize > 0 && it.downloadedSize > 0) {
+                        maxOf(totalSize, it.downloadedSize)
+                    } else totalSize
+                    it.copy(totalSize = safeTotal)
+                } else it
             }
         }
         scope.launch(dbDispatcher) { dbHelper.updateTotalSize(id, totalSize) }

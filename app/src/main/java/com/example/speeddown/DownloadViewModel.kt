@@ -65,8 +65,8 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch { repo.updateSettings(newSettings) }
     }
 
-    fun addDownload(url: String, fileName: String, threads: Int, audioUrl: String? = null) {
-        viewModelScope.launch { repo.addDownload(url = url, fileName = fileName, threads = threads, audioUrl = audioUrl) }
+    fun addDownload(url: String, fileName: String, threads: Int, audioUrl: String? = null, originalUrl: String? = null) {
+        viewModelScope.launch { repo.addDownload(url = url, fileName = fileName, threads = threads, audioUrl = audioUrl, originalUrl = originalUrl) }
     }
 
     fun addBatchDownloads(urls: List<String>, threads: Int) {

@@ -198,7 +198,8 @@ fun YouTubeDownloadBottomSheet(
                                 url = stream.url,
                                 fileName = fullFileName,
                                 threads = defaultThreads,
-                                audioUrl = audioUrl
+                                audioUrl = audioUrl,
+                                originalUrl = state.mediaInfo.originalUrl
                             )
 
                             val category = if (isAudio) "Music" else "Video"

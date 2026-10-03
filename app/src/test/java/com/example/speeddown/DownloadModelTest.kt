@@ -81,6 +81,22 @@ class DownloadModelTest {
     }
 
     @Test
+    fun testDownloadItem_hlsProgressCalculation() {
+        val hlsItem = DownloadItem(
+            id = 5L,
+            url = "https://example.com/playlist.m3u8",
+            fileName = "stream.mp4",
+            filePath = "/test/stream.mp4",
+            totalSize = -1L,
+            downloadedSize = 5_000_000L,
+            isHls = true,
+            partProgress = listOf(0.42f)
+        )
+        assertEquals(0.42f, hlsItem.progress, 0.001f)
+        assertEquals(42, hlsItem.progressPercent)
+    }
+
+    @Test
     fun testContentRange_validationAnd200RestartDecisions() {
         // Parse Content-Range header
         val validRange = MultiThreadDownloader.parseContentRange("bytes 0-499/1000")

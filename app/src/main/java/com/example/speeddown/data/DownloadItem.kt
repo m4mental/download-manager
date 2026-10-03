@@ -34,7 +34,11 @@ data class DownloadItem(
     val actualThreads: Int? = null
 ) {
     val progress: Float
-        get() = if (totalSize > 0) (downloadedSize.toFloat() / totalSize.toFloat()) else 0f
+        get() = when {
+            isHls && partProgress.isNotEmpty() -> partProgress.first().coerceIn(0f, 1f)
+            totalSize > 0 -> (downloadedSize.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f)
+            else -> 0f
+        }
 
     val progressPercent: Int
         get() = (progress * 100).toInt()

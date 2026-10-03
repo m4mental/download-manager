@@ -87,8 +87,47 @@ class DownloadRepository(private val context: Context) {
         url: String,
         fileName: String,
         threads: Int = 4,
-        audioUrl: String? = null
+        audioUrl: String? = null,
+        originalUrl: String? = null
     ): Long {
+        val cleanUrl = url.trim()
+
+        // 1. Auto-revive / Restart check:
+        // If the user previously cancelled, paused, or had a failure on this exact URL or filename,
+        // revive and restart it directly instead of creating a conflicting duplicate or stalling.
+        val allDownloads = store.getAllDownloads()
+        val existingItem = allDownloads.firstOrNull {
+            it.url.equals(cleanUrl, ignoreCase = true) ||
+            (!originalUrl.isNullOrBlank() && it.originalUrl.equals(originalUrl, ignoreCase = true)) ||
+            (it.fileName.equals(fileName.trim(), ignoreCase = true) && (it.status == DownloadStatus.CANCELLED || it.status == DownloadStatus.FAILED))
+        }
+
+        if (existingItem != null) {
+            when (existingItem.status) {
+                DownloadStatus.CANCELLED, DownloadStatus.FAILED, DownloadStatus.PAUSED -> {
+                    val settingsSnapshot = store.getSettingsSnapshot()
+                    val effectiveThreads = if (threads <= 0) settingsSnapshot.defaultThreads else threads
+                    val updatedItem = existingItem.copy(
+                        url = cleanUrl,
+                        audioUrl = audioUrl ?: existingItem.audioUrl,
+                        originalUrl = originalUrl ?: existingItem.originalUrl,
+                        threads = effectiveThreads,
+                        status = DownloadStatus.DOWNLOADING,
+                        errorMessage = null
+                    )
+                    store.upsert(updatedItem)
+                    resumeDownload(updatedItem)
+                    return updatedItem.id
+                }
+                DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED -> {
+                    return existingItem.id
+                }
+                DownloadStatus.COMPLETED -> {
+                    // Let regular unique file creation proceed below if re-downloading a completed file
+                }
+            }
+        }
+
         val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val appExtDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         val hasManager = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()
@@ -98,7 +137,6 @@ class DownloadRepository(private val context: Context) {
             appExtDir ?: publicDir
         }
 
-        val cleanUrl = url.trim()
         val isMagnet = com.example.speeddown.engine.TorrentEngine.isMagnet(cleanUrl)
         val isHls = cleanUrl.contains(".m3u8", ignoreCase = true)
         val magnetMetadata = if (isMagnet) com.example.speeddown.engine.TorrentEngine.parseMagnet(cleanUrl) else null
@@ -141,7 +179,8 @@ class DownloadRepository(private val context: Context) {
             isStreamable = isStreamable,
             isTorrent = isMagnet,
             isHls = isHls,
-            audioUrl = audioUrl
+            audioUrl = audioUrl,
+            originalUrl = originalUrl
         )
         store.upsert(item)
         startServiceAction(DownloadService.ACTION_START, item.id)

@@ -158,7 +158,7 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
     LaunchedEffect(Unit) {
         val clip = clipboardManager.getText()?.text?.trim() ?: ""
         if ((clip.startsWith("http://") || clip.startsWith("https://") || clip.startsWith("magnet:?xt=urn:btih:")) &&
-            downloads.none { it.url == clip }
+            downloads.none { it.url == clip && (it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED) }
         ) {
             clipboardUrl = clip
         }
@@ -533,12 +533,21 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
                 initialUrlForDialog = null
             },
             onAdd = { url, name, threads ->
-                val dup = viewModel.checkDuplicate(name)
-                if (dup != null) {
-                    duplicateWarningFile = dup
-                    pendingDownloadData = Triple(url, name, threads)
-                } else {
+                val clean = url.trim()
+                val existingRevivable = downloads.firstOrNull {
+                    (it.url.equals(clean, ignoreCase = true) || it.fileName.equals(name.trim(), ignoreCase = true)) &&
+                    (it.status == DownloadStatus.CANCELLED || it.status == DownloadStatus.FAILED || it.status == DownloadStatus.PAUSED)
+                }
+                if (existingRevivable != null) {
                     viewModel.addDownload(url, name, threads)
+                } else {
+                    val dup = viewModel.checkDuplicate(name)
+                    if (dup != null) {
+                        duplicateWarningFile = dup
+                        pendingDownloadData = Triple(url, name, threads)
+                    } else {
+                        viewModel.addDownload(url, name, threads)
+                    }
                 }
                 showAddDialog = false
                 initialUrlForDialog = null
