@@ -67,9 +67,9 @@ class DownloadService : Service() {
 
         val dispatcher = okhttp3.Dispatcher().apply {
             maxRequests = 250
-            maxRequestsPerHost = 200
+            maxRequestsPerHost = 250
         }
-        val connectionPool = okhttp3.ConnectionPool(120, 5, TimeUnit.MINUTES)
+        val connectionPool = okhttp3.ConnectionPool(250, 5, TimeUnit.MINUTES)
 
         // Initialize OkHttpClient without blocking main thread via runBlocking
         val client = OkHttpClient.Builder()

@@ -8,6 +8,7 @@ import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -163,7 +164,18 @@ class MultiThreadDownloader(
         return lower.contains("googlevideo.com") || lower.contains("youtube.com") || lower.contains("youtu.be")
     }
 
-    private val downloadDispatcher = Dispatchers.IO.limitedParallelism(128)
+    private val downloadDispatcher = Dispatchers.IO.limitedParallelism(256)
+
+    /**
+     * Dedicated HTTP/1.1 client for multi-part downloads.
+     * Prevents HTTP/2 stream multiplexing where 100 threads choke on 1 single TCP connection.
+     * With HTTP/1.1, each worker thread gets its own dedicated, unconstrained TCP socket.
+     */
+    private val chunkHttpClient: OkHttpClient by lazy {
+        okHttpClient.newBuilder()
+            .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+            .build()
+    }
 
     suspend fun cancelAndJoinDownload(downloadId: Long) {
         cancelAndJoin(downloadId)
@@ -784,16 +796,18 @@ class MultiThreadDownloader(
         }
 
         if (targetFile.exists()) targetFile.delete()
-        FileOutputStream(targetFile).use { outputStream ->
+        val rawOut = FileOutputStream(targetFile)
+        BufferedOutputStream(rawOut, 512 * 1024).use { outputStream ->
             for (i in 0 until threadCount) {
                 val pFile = getPartFile(filePath, i, threadCount)
                 if (pFile.exists()) {
                     pFile.inputStream().use { inputStream ->
-                        inputStream.copyTo(outputStream, bufferSize = 65536)
+                        inputStream.copyTo(outputStream, bufferSize = 262144)
                     }
                     pFile.delete()
                 }
             }
+            outputStream.flush()
         }
     }
 
@@ -820,16 +834,26 @@ class MultiThreadDownloader(
             java.util.Collections.synchronizedList(mutableListOf())
         }
 
+        // Use dedicated HTTP/1.1 client for multi-threaded chunk downloads to avoid HTTP/2 single-connection multiplex bottlenecks
+        val clientToUse = if (threadCount > 1 && !isYt) chunkHttpClient else okHttpClient
+
         var attempts = 0
         val maxAttempts = 6
+        var lastDownloadedBytes = -1L
         while (attempts < maxAttempts && !cancelFlag.get() && !pauseFlag.get()) {
-            attempts++
             val existingBytes = if (useRange && partFile.exists()) partFile.length() else 0L
             partProgressBytes.set(existingBytes)
 
             if (useRange && expectedLength > 0 && existingBytes >= expectedLength) {
                 return
             }
+
+            // If progress was made since last attempt, reset failure counter so large downloads don't fail after multiple auto-refreshes
+            if (existingBytes > lastDownloadedBytes) {
+                attempts = 0
+                lastDownloadedBytes = existingBytes
+            }
+            attempts++
 
             val requestStart = if (useRange) chunkStart + existingBytes else 0L
             val requestBuilder = Request.Builder()
@@ -854,7 +878,7 @@ class MultiThreadDownloader(
                 }
             }
 
-            val call = okHttpClient.newCall(requestBuilder.build())
+            val call = clientToUse.newCall(requestBuilder.build())
             callList.add(call)
 
             try {
@@ -906,22 +930,34 @@ class MultiThreadDownloader(
                     throw IOException("Empty response body from server")
                 }
 
-                val buffer = ByteArray(65536)
-                FileOutputStream(partFile, useRange).use { fileOut ->
+                val buffer = ByteArray(131072)
+                val rawOut = FileOutputStream(partFile, useRange)
+                BufferedOutputStream(rawOut, 256 * 1024).use { fileOut ->
                     body.byteStream().use { stream ->
+                        var uncommittedBytes = 0L
+                        var intervalStartTime = System.currentTimeMillis()
+                        var intervalBytesRead = 0L
+
                         while (!cancelFlag.get() && !pauseFlag.get()) {
-                            val currentPartLen = partProgressBytes.get()
+                            val currentPartLen = partProgressBytes.get() + uncommittedBytes
                             val remainingExpected = if (expectedLength > 0) (expectedLength - currentPartLen) else Long.MAX_VALUE
                             if (remainingExpected <= 0) break
 
                             val read = stream.read(buffer)
                             if (read == -1) break
 
+                            val now = System.currentTimeMillis()
+                            intervalBytesRead += read
+
                             val maxToWrite = minOf(read.toLong(), remainingExpected).toInt()
                             if (maxToWrite > 0) {
                                 fileOut.write(buffer, 0, maxToWrite)
-                                partProgressBytes.addAndGet(maxToWrite.toLong())
-                                totalDownloaded.addAndGet(maxToWrite.toLong())
+                                uncommittedBytes += maxToWrite
+                                if (uncommittedBytes >= 65536L || (expectedLength > 0 && currentPartLen + maxToWrite >= expectedLength)) {
+                                    partProgressBytes.addAndGet(uncommittedBytes)
+                                    totalDownloaded.addAndGet(uncommittedBytes)
+                                    uncommittedBytes = 0L
+                                }
                             }
 
                             if (read > maxToWrite) {
@@ -935,6 +971,27 @@ class MultiThreadDownloader(
                                     delay(sleepMs.coerceAtMost(250L))
                                 }
                             }
+
+                            // Dynamic connection stall / throttle auto-refresh:
+                            // If a thread's connection gets throttled (< 10 KB/s) for 6+ seconds while large data remains,
+                            // refresh the connection so the server grants the initial high-speed burst rate again.
+                            if (useRange && threadCount > 1 && remainingExpected > 500 * 1024L) {
+                                val intervalElapsed = now - intervalStartTime
+                                if (intervalElapsed >= 6000L) {
+                                    val intervalSpeedBps = (intervalBytesRead * 1000L) / intervalElapsed
+                                    if (intervalSpeedBps < 10 * 1024L) {
+                                        Log.w(TAG, "Part $chunkStart throttled by server (${intervalSpeedBps / 1024} KB/s), auto-refreshing connection...")
+                                        throw SocketTimeoutException("Connection throttled by server, auto-accelerating...")
+                                    }
+                                    intervalStartTime = now
+                                    intervalBytesRead = 0L
+                                }
+                            }
+                        }
+                        if (uncommittedBytes > 0) {
+                            partProgressBytes.addAndGet(uncommittedBytes)
+                            totalDownloaded.addAndGet(uncommittedBytes)
+                            uncommittedBytes = 0L
                         }
                         fileOut.flush()
                     }
@@ -978,11 +1035,14 @@ class MultiThreadDownloader(
                         e.message?.contains("unexpected end of stream", ignoreCase = true) == true ||
                         e.message?.contains("reset", ignoreCase = true) == true ||
                         e.message?.contains("pipe", ignoreCase = true) == true ||
-                        e.message?.contains("connection abort", ignoreCase = true) == true
+                        e.message?.contains("connection abort", ignoreCase = true) == true ||
+                        e.message?.contains("auto-accelerating", ignoreCase = true) == true
 
                 if (attempts < maxAttempts && isConnectionDrop) {
-                    Log.w(TAG, "Chunk $chunkStart connection dropped (${e.message}), auto-retrying ($attempts/$maxAttempts) in ${attempts * 1000}ms...")
-                    delay(attempts * 1000L)
+                    val isAutoAccelerate = e.message?.contains("auto-accelerating", ignoreCase = true) == true
+                    val retryDelay = if (isAutoAccelerate) 100L else (attempts * 1000L)
+                    Log.w(TAG, "Chunk $chunkStart connection dropped/re-accelerating (${e.message}), auto-retrying in ${retryDelay}ms...")
+                    delay(retryDelay)
                     continue
                 }
                 throw e
