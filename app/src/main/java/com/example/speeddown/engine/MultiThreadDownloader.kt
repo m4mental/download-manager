@@ -90,11 +90,10 @@ class MultiThreadDownloader(
             return ContentRangeInfo(start, end, total)
         }
 
-        fun isValidContentRange(contentRange: String?, expectedStart: Long, expectedEnd: Long): Boolean {
+        fun isValidContentRange(contentRange: String?, expectedStart: Long, expectedEnd: Long = -1L): Boolean {
             val info = parseContentRange(contentRange) ?: return false
             if (info.start != expectedStart) return false
-            if (expectedEnd > 0 && info.end != expectedEnd) return false
-            if (expectedEnd <= 0 && info.end < info.start) return false
+            if (info.end < info.start) return false
             return true
         }
 
@@ -294,12 +293,16 @@ class MultiThreadDownloader(
             val contentLength = probeResult.contentLength
             val acceptsRanges = probeResult.acceptsRanges
 
+            val effectiveConfiguredThreads = if (item.actualThreads != null && item.actualThreads > 0) {
+                item.actualThreads
+            } else item.threads
+
             var threadCount = when {
                 isYouTubeOrGoogleVideo(item.url) -> 1
                 !acceptsRanges || contentLength <= 0 -> 1
                 contentLength < 1_000_000 -> 1
-                contentLength < 10_000_000 -> minOf(item.threads, 8)
-                else -> item.threads.coerceIn(1, 100)
+                contentLength < 10_000_000 -> minOf(effectiveConfiguredThreads, 8)
+                else -> effectiveConfiguredThreads.coerceIn(1, 100)
             }
 
             store.updateTransferDetails(
@@ -1068,7 +1071,7 @@ class MultiThreadDownloader(
                     val targetEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
                     if (!isValidContentRange(contentRange, requestStart, targetEnd)) {
                         response.close()
-                        throw IOException("HTTP 206 Content-Range mismatch: '$contentRange', expected start $requestStart, end $targetEnd")
+                        throw IOException("HTTP 206 Content-Range mismatch: '$contentRange', expected start $requestStart")
                     }
                 }
 

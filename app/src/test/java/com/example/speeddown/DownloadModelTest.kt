@@ -117,7 +117,9 @@ class DownloadModelTest {
         // Validate Content-Range against expected offsets
         assertTrue(MultiThreadDownloader.isValidContentRange("bytes 0-499/1000", expectedStart = 0L, expectedEnd = 499L))
         assertFalse(MultiThreadDownloader.isValidContentRange("bytes 0-499/1000", expectedStart = 100L, expectedEnd = 499L))
-        assertFalse(MultiThreadDownloader.isValidContentRange("bytes 0-499/1000", expectedStart = 0L, expectedEnd = 500L))
+        // Server returning wider range (e.g. 0-999) or slice range is valid per RFC 9110 as long as start offset matches
+        assertTrue(MultiThreadDownloader.isValidContentRange("bytes 0-999/1000", expectedStart = 0L, expectedEnd = 500L))
+        assertFalse(MultiThreadDownloader.isValidContentRange("bytes 500-400/1000", expectedStart = 500L))
 
         // 200 restart decisions
         assertTrue(MultiThreadDownloader.shouldRestartFromZeroOn200(useRange = true, statusCode = 200))
@@ -439,6 +441,19 @@ class DownloadModelTest {
         assertTrue(MultiThreadDownloader.isNumberedPartFileName("archive.zip.part0", "archive.zip"))
         assertFalse(MultiThreadDownloader.isNumberedPartFileName("archive.zip.helper", "archive.zip"))
         assertFalse(MultiThreadDownloader.isNumberedPartFileName("other.zip.part0.helper", "archive.zip"))
+    }
+
+    @Test
+    fun testFormatSize_exactTwoDecimals() {
+        assertEquals("0 B", com.example.speeddown.ui.components.formatSize(0L))
+        assertEquals("500 B", com.example.speeddown.ui.components.formatSize(500L))
+        assertEquals("1.0 KB", com.example.speeddown.ui.components.formatSize(1024L))
+        assertEquals("100.00 MB", com.example.speeddown.ui.components.formatSize(100L * 1024 * 1024))
+        assertEquals("1.06 GB", com.example.speeddown.ui.components.formatSize(1140492625L))
+        assertEquals("1.19 GB", com.example.speeddown.ui.components.formatSize(1280337433L))
+        assertEquals("1.20 GB", com.example.speeddown.ui.components.formatSize(1288445064L))
+        assertEquals("1.21 GB", com.example.speeddown.ui.components.formatSize(1296996275L))
+        assertEquals("1.31 GB", com.example.speeddown.ui.components.formatSize(1402191177L))
     }
 }
 

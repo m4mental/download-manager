@@ -29,7 +29,12 @@ fun formatSize(bytes: Long): String {
     if (bytes <= 0) return "0 B"
     val units = arrayOf("B", "KB", "MB", "GB", "TB")
     val digitGroups = (ln(bytes.toDouble()) / ln(1024.0)).toInt().coerceIn(0, 4)
-    return "%.1f %s".format(bytes / 1024.0.pow(digitGroups.toDouble()), units[digitGroups])
+    val value = bytes / 1024.0.pow(digitGroups.toDouble())
+    return when (digitGroups) {
+        0 -> "$bytes B"
+        1 -> String.format(java.util.Locale.US, "%.1f KB", value)
+        else -> String.format(java.util.Locale.US, "%.2f %s", value, units[digitGroups])
+    }
 }
 
 fun formatSpeed(bps: Long): String {

@@ -131,12 +131,18 @@ class DownloadRepository(private val context: Context) {
             when (existingItem.status) {
                 DownloadStatus.CANCELLED, DownloadStatus.FAILED, DownloadStatus.PAUSED -> {
                     val settingsSnapshot = store.getSettingsSnapshot()
-                    val effectiveThreads = if (threads <= 0) settingsSnapshot.defaultThreads else threads
+                    val fallbackThreads = if (threads <= 0) settingsSnapshot.defaultThreads else threads
+                    val preservedThreads = if (existingItem.actualThreads != null && existingItem.actualThreads > 0) {
+                        existingItem.actualThreads
+                    } else if (existingItem.threads > 0) {
+                        existingItem.threads
+                    } else fallbackThreads
+
                     val updatedItem = existingItem.copy(
                         url = cleanUrl,
                         audioUrl = audioUrl ?: existingItem.audioUrl,
                         originalUrl = originalUrl ?: existingItem.originalUrl,
-                        threads = effectiveThreads,
+                        threads = preservedThreads,
                         status = DownloadStatus.DOWNLOADING,
                         errorMessage = null
                     )
