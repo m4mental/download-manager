@@ -43,12 +43,6 @@ class MainActivity : ComponentActivity() {
             if (store.getActiveDownloads().isEmpty()) {
                 val nm = getSystemService(android.content.Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
                 nm?.cancel(com.example.speeddown.service.DownloadService.NOTIFICATION_ID)
-                try {
-                    val cancelIntent = android.content.Intent(this@MainActivity, com.example.speeddown.service.DownloadService::class.java).apply {
-                        action = com.example.speeddown.service.DownloadService.ACTION_CANCEL
-                    }
-                    startService(cancelIntent)
-                } catch (_: Exception) {}
             }
         }
 

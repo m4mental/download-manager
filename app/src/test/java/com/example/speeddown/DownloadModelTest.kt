@@ -414,4 +414,31 @@ class DownloadModelTest {
         val excessive = MediaMuxerEngine.calculateBufferSize(40 * 1024 * 1024, defaultVideo, budgetVideo)
         assertTrue(excessive.isFailure)
     }
+
+    @Test
+    fun testMonotonicChunkProgress() {
+        val previousParts = listOf(0.4f, 0.8f, 0.2f, 1.0f)
+        val incomingParts = listOf(0.5f, 0.75f, 0.3f, 0.9f) // Part 1 and Part 3 reported lower due to reconnect
+
+        val monotonicParts = incomingParts.mapIndexed { idx, newProg ->
+            val oldProg = previousParts.getOrElse(idx) { 0f }
+            maxOf(oldProg, newProg)
+        }
+
+        assertEquals(0.5f, monotonicParts[0], 0.001f)
+        assertEquals(0.8f, monotonicParts[1], 0.001f) // Held at 0.8f, didn't drop to 0.75f
+        assertEquals(0.3f, monotonicParts[2], 0.001f)
+        assertEquals(1.0f, monotonicParts[3], 0.001f) // Held at 1.0f, didn't drop to 0.9f
+    }
+
+    @Test
+    fun testIsNumberedPartFileName_matchesHelperFiles() {
+        assertTrue(MultiThreadDownloader.isNumberedPartFileName("archive.zip.part0.helper", "archive.zip"))
+        assertTrue(MultiThreadDownloader.isNumberedPartFileName("archive.zip.part15.helper", "archive.zip"))
+        assertTrue(MultiThreadDownloader.isNumberedPartFileName("archive.zip.part.helper", "archive.zip"))
+        assertTrue(MultiThreadDownloader.isNumberedPartFileName("archive.zip.part0", "archive.zip"))
+        assertFalse(MultiThreadDownloader.isNumberedPartFileName("archive.zip.helper", "archive.zip"))
+        assertFalse(MultiThreadDownloader.isNumberedPartFileName("other.zip.part0.helper", "archive.zip"))
+    }
 }
+

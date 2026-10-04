@@ -10,11 +10,18 @@ import com.example.speeddown.data.DownloadSettings
 import com.example.speeddown.data.DownloadStatus
 import com.example.speeddown.data.DownloadStore
 import com.example.speeddown.service.DownloadService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class DownloadRepository(private val context: Context) {
 
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val store = DownloadStore.getInstance(context)
 
     val allDownloads: Flow<List<DownloadItem>> = store.allDownloads
@@ -83,13 +90,31 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
+    fun addDownloadAsync(
+        url: String,
+        fileName: String,
+        threads: Int = 4,
+        audioUrl: String? = null,
+        originalUrl: String? = null
+    ) {
+        appScope.launch {
+            addDownload(url, fileName, threads, audioUrl, originalUrl)
+        }
+    }
+
+    fun addBatchDownloadsAsync(urls: List<String>, threads: Int = 16) {
+        appScope.launch {
+            addBatchDownloads(urls, threads)
+        }
+    }
+
     suspend fun addDownload(
         url: String,
         fileName: String,
         threads: Int = 4,
         audioUrl: String? = null,
         originalUrl: String? = null
-    ): Long {
+    ): Long = withContext(NonCancellable) {
         val cleanUrl = url.trim()
 
         // 1. Auto-revive / Restart check:
@@ -117,10 +142,10 @@ class DownloadRepository(private val context: Context) {
                     )
                     store.upsert(updatedItem)
                     resumeDownload(updatedItem)
-                    return updatedItem.id
+                    return@withContext updatedItem.id
                 }
                 DownloadStatus.DOWNLOADING, DownloadStatus.QUEUED -> {
-                    return existingItem.id
+                    return@withContext existingItem.id
                 }
                 DownloadStatus.COMPLETED -> {
                     // Let regular unique file creation proceed below if re-downloading a completed file
@@ -174,7 +199,7 @@ class DownloadRepository(private val context: Context) {
             fileName = uniqueFileName,
             filePath = filePath,
             threads = effectiveThreads,
-            status = DownloadStatus.QUEUED,
+            status = DownloadStatus.DOWNLOADING,
             category = category,
             isStreamable = isStreamable,
             isTorrent = isMagnet,
@@ -184,7 +209,7 @@ class DownloadRepository(private val context: Context) {
         )
         store.upsert(item)
         startServiceAction(DownloadService.ACTION_START, item.id)
-        return item.id
+        item.id
     }
 
     fun checkDuplicateFile(fileName: String): File? {
@@ -307,7 +332,7 @@ class DownloadRepository(private val context: Context) {
         deletedCount
     }
 
-    suspend fun addBatchDownloads(urls: List<String>, threads: Int = 16): Int {
+    suspend fun addBatchDownloads(urls: List<String>, threads: Int = 16): Int = withContext(NonCancellable) {
         var count = 0
         for (u in urls) {
             val clean = u.trim()
@@ -318,7 +343,7 @@ class DownloadRepository(private val context: Context) {
                 count++
             }
         }
-        return count
+        count
     }
 
     suspend fun calculateChecksums(filePath: String): Pair<String, String> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -343,12 +368,12 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
-    suspend fun pauseDownload(item: DownloadItem) {
+    suspend fun pauseDownload(item: DownloadItem) = withContext(NonCancellable) {
         store.updateStatus(item.id, DownloadStatus.PAUSED)
         startServiceAction(DownloadService.ACTION_PAUSE, item.id)
     }
 
-    suspend fun resumeDownload(item: DownloadItem) {
+    suspend fun resumeDownload(item: DownloadItem) = withContext(NonCancellable) {
         val file = File(item.filePath)
         val parent = file.parentFile
         val correctedItem = if (parent == null || !parent.canWrite()) {
@@ -444,12 +469,12 @@ class DownloadRepository(private val context: Context) {
         startServiceAction(DownloadService.ACTION_RESUME, correctedItem.id)
     }
 
-    suspend fun cancelDownload(item: DownloadItem) {
+    suspend fun cancelDownload(item: DownloadItem) = withContext(NonCancellable) {
         store.updateStatus(item.id, DownloadStatus.CANCELLED)
         startServiceAction(DownloadService.ACTION_CANCEL, item.id)
     }
 
-    suspend fun deleteDownload(item: DownloadItem, deleteFile: Boolean = true) {
+    suspend fun deleteDownload(item: DownloadItem, deleteFile: Boolean = true) = withContext(NonCancellable) {
         // 1. Mark cancelled first so UI immediately updates
         store.updateStatus(item.id, DownloadStatus.CANCELLED)
 

@@ -296,11 +296,18 @@ class DownloadService : Service() {
 
             val progressCallback: (Long, Long, List<Float>) -> Unit = { downloaded, speed, parts ->
                 serviceScope.launch {
-                    val currentItem = store.getById(downloadId)
-                    if (currentItem == null || currentItem.status != DownloadStatus.DOWNLOADING) {
+                    val currentItem = store.getById(downloadId) ?: return@launch
+                    if (currentItem.status == DownloadStatus.CANCELLED) {
                         downloader.cancelDownload(downloadId)
                         hlsDownloader.cancelHls(downloadId)
                         torrentEngine.cancelTorrent(downloadId)
+                        updateActiveNotification()
+                        return@launch
+                    }
+                    if (currentItem.status == DownloadStatus.PAUSED) {
+                        downloader.pauseDownload(downloadId)
+                        hlsDownloader.pauseHls(downloadId)
+                        torrentEngine.pauseTorrent(downloadId)
                         updateActiveNotification()
                         return@launch
                     }
@@ -373,9 +380,11 @@ class DownloadService : Service() {
     }
 
     private fun updateActiveNotification() {
-        val active = store.getActiveDownloads()
+        val all = store.getAllDownloads()
+        val active = all.filter { it.status == DownloadStatus.DOWNLOADING }
+        val queued = all.filter { it.status == DownloadStatus.QUEUED }
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        if (active.isEmpty()) {
+        if (active.isEmpty() && queued.isEmpty()) {
             releaseWakeLock()
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -388,7 +397,7 @@ class DownloadService : Service() {
             isForeground = false
             nm.cancel(NOTIFICATION_ID)
             stopSelf()
-        } else {
+        } else if (active.isNotEmpty()) {
             acquireWakeLock()
             val firstActive = active.first()
             updateNotification(
@@ -398,6 +407,9 @@ class DownloadService : Service() {
                 downloaded = firstActive.downloadedSize,
                 speed = firstActive.speed
             )
+        } else {
+            // Active is empty but queued downloads exist - trigger execution
+            checkAndStartNextQueued()
         }
     }
 

@@ -241,11 +241,14 @@ class DownloadStore private constructor(private val context: Context) {
                         }
 
                         val effectivePartProgress = if (partProgress.isNotEmpty()) {
-                            if (it.isHls && it.partProgress.isNotEmpty()) {
-                                val maxProg = maxOf(it.partProgress.first(), partProgress.first())
-                                listOf(maxProg)
-                            } else {
+                            if (forceReset || it.partProgress.isEmpty() || it.partProgress.size != partProgress.size) {
                                 partProgress
+                            } else {
+                                // Monotonic non-decreasing chunk progress: individual chunks never visually jump backwards
+                                partProgress.mapIndexed { idx, newProg ->
+                                    val oldProg = it.partProgress.getOrElse(idx) { 0f }
+                                    maxOf(oldProg, newProg)
+                                }
                             }
                         } else it.partProgress
                         finalPartProgress = effectivePartProgress

@@ -10,6 +10,7 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.net.ConnectException
@@ -17,6 +18,7 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLException
 
@@ -102,7 +104,7 @@ class MultiThreadDownloader(
 
         fun isNumberedPartFileName(fileName: String, baseFileName: String): Boolean {
             val escaped = Regex.escape(baseFileName)
-            return fileName.matches(Regex("""^$escaped\.part(\d+)?$"""))
+            return fileName.matches(Regex("""^$escaped\.part(\d+)?(\.helper)?$"""))
         }
 
         fun shouldDiscardPartsAndRestart(
@@ -611,31 +613,135 @@ class MultiThreadDownloader(
             }
         }
 
+        val trackers = (0 until threadCount).map { i ->
+            val partFile = getPartFile(filePath, i, threadCount)
+            val realStart = if (chunkSize > 0) i * chunkSize else 0L
+            val realEnd = if (chunkSize > 0) {
+                if (i == threadCount - 1) contentLength - 1 else (i + 1) * chunkSize - 1
+            } else -1L
+            PartTracker(
+                partIndex = i,
+                chunkStart = realStart,
+                chunkEnd = realEnd,
+                partFile = partFile,
+                partProgressBytes = partProgressBytes[i]
+            )
+        }
+        val activeThreadsCount = AtomicInteger(threadCount)
+
         try {
             coroutineScope {
                 val deferreds = (0 until threadCount).map { i ->
-                    val partFile = getPartFile(filePath, i, threadCount)
-                    val realStart = if (chunkSize > 0) i * chunkSize else 0L
-                    val realEnd = if (chunkSize > 0) {
-                        if (i == threadCount - 1) contentLength - 1 else (i + 1) * chunkSize - 1
-                    } else -1L
-
+                    val myTracker = trackers[i]
                     async(downloadDispatcher) {
-                        downloadPart(
-                            downloadId = downloadId,
-                            url = url,
-                            partFile = partFile,
-                            chunkStart = realStart,
-                            chunkEnd = realEnd,
-                            partProgressBytes = partProgressBytes[i],
-                            totalDownloaded = streamDownloaded,
-                            speedLimitKbps = speedLimitKbps,
-                            threadCount = threadCount,
-                            cancelFlag = cancelFlag,
-                            pauseFlag = pauseFlag,
-                            useRange = acceptsRanges && realEnd > 0,
-                            validator = validator
-                        )
+                        try {
+                            downloadPart(
+                                downloadId = downloadId,
+                                url = url,
+                                partFile = myTracker.partFile,
+                                chunkStart = myTracker.chunkStart,
+                                chunkEnd = myTracker.chunkEnd,
+                                partProgressBytes = myTracker.partProgressBytes,
+                                totalDownloaded = streamDownloaded,
+                                speedLimitKbps = speedLimitKbps,
+                                threadCount = threadCount,
+                                cancelFlag = cancelFlag,
+                                pauseFlag = pauseFlag,
+                                useRange = acceptsRanges && myTracker.chunkEnd > 0,
+                                validator = validator,
+                                activeThreadsCount = activeThreadsCount,
+                                dynamicEndSupplier = { myTracker.chunkEnd }
+                            )
+                        } finally {
+                            myTracker.isCompleted.set(true)
+                            activeThreadsCount.decrementAndGet()
+                        }
+
+                        // Endgame Work-Stealing:
+                        // When this worker finishes its own chunk early, help any unfinished straggler chunk (> 256 KB)
+                        if (acceptsRanges && threadCount > 1) {
+                            while (!cancelFlag.get() && !pauseFlag.get()) {
+                                if (activeThreadsCount.get() <= 0) break
+
+                                val candidate = trackers
+                                    .filter { !it.isCompleted.get() && !it.isBeingHelped.get() }
+                                    .maxByOrNull { t ->
+                                        val dl = t.partProgressBytes.get()
+                                        val totalExp = t.chunkEnd - t.chunkStart + 1
+                                        totalExp - dl
+                                    } ?: break
+
+                                val currentDownloaded = candidate.partProgressBytes.get()
+                                val totalExp = candidate.chunkEnd - candidate.chunkStart + 1
+                                val remaining = totalExp - currentDownloaded
+
+                                if (remaining < 256 * 1024L) break
+                                if (!candidate.isBeingHelped.compareAndSet(false, true)) continue
+
+                                val originalCandidateEnd = candidate.chunkEnd
+                                val half = remaining / 2
+                                val helperStart = candidate.chunkStart + currentDownloaded + half
+                                val helperEnd = originalCandidateEnd
+                                val newCandidateEnd = helperStart - 1
+
+                                candidate.chunkEnd = newCandidateEnd
+
+                                val helperFile = File(candidate.partFile.parentFile, "${candidate.partFile.name}.helper")
+                                if (helperFile.exists()) helperFile.delete()
+
+                                val helperProgress = AtomicLong(0L)
+                                var helperSuccess = false
+                                activeThreadsCount.incrementAndGet()
+                                try {
+                                    downloadPart(
+                                        downloadId = downloadId,
+                                        url = url,
+                                        partFile = helperFile,
+                                        chunkStart = helperStart,
+                                        chunkEnd = helperEnd,
+                                        partProgressBytes = helperProgress,
+                                        totalDownloaded = streamDownloaded,
+                                        speedLimitKbps = speedLimitKbps,
+                                        threadCount = threadCount,
+                                        cancelFlag = cancelFlag,
+                                        pauseFlag = pauseFlag,
+                                        useRange = true,
+                                        validator = validator,
+                                        activeThreadsCount = activeThreadsCount,
+                                        dynamicEndSupplier = null
+                                    )
+                                    val expectedHelperBytes = helperEnd - helperStart + 1
+                                    if (helperFile.exists() && helperFile.length() == expectedHelperBytes) {
+                                        helperSuccess = true
+                                    }
+                                } catch (_: Exception) {
+                                    helperSuccess = false
+                                } finally {
+                                    activeThreadsCount.decrementAndGet()
+                                }
+
+                                if (helperSuccess) {
+                                    // Wait until candidate thread finishes writing its lower half and closes its stream
+                                    while (!candidate.isCompleted.get() && !cancelFlag.get() && !pauseFlag.get()) {
+                                        delay(50L)
+                                    }
+                                    val expectedCandidateLowerBytes = helperStart - candidate.chunkStart
+                                    if (!cancelFlag.get() && !pauseFlag.get() &&
+                                        candidate.partFile.exists() && candidate.partFile.length() == expectedCandidateLowerBytes) {
+                                        appendFile(helperFile, candidate.partFile)
+                                        candidate.partProgressBytes.set(candidate.partFile.length())
+                                        candidate.chunkEnd = originalCandidateEnd
+                                    }
+                                    if (helperFile.exists()) helperFile.delete()
+                                } else {
+                                    if (helperFile.exists()) helperFile.delete()
+                                    if (!candidate.isCompleted.get()) {
+                                        candidate.chunkEnd = originalCandidateEnd
+                                        candidate.isBeingHelped.set(false)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 deferreds.awaitAll()
@@ -781,11 +887,34 @@ class MultiThreadDownloader(
             try {
                 val f = getPartFile(filePath, i, threadCount)
                 if (f.exists()) f.delete()
+                val helper = File(f.parentFile, "${f.name}.helper")
+                if (helper.exists()) helper.delete()
             } catch (_: Exception) {}
         }
         val singlePart = File("$filePath.part")
         if (singlePart.exists()) {
             try { singlePart.delete() } catch (_: Exception) {}
+        }
+    }
+
+    private class PartTracker(
+        val partIndex: Int,
+        val chunkStart: Long,
+        @Volatile var chunkEnd: Long,
+        val partFile: File,
+        val partProgressBytes: AtomicLong,
+        val isCompleted: AtomicBoolean = AtomicBoolean(false),
+        val isBeingHelped: AtomicBoolean = AtomicBoolean(false)
+    )
+
+    private fun appendFile(source: File, destination: File) {
+        if (!source.exists()) return
+        val inStream = FileInputStream(source)
+        val outStream = FileOutputStream(destination, true)
+        inStream.use { input ->
+            outStream.use { output ->
+                input.copyTo(output, bufferSize = 262144)
+            }
         }
     }
 
@@ -830,11 +959,12 @@ class MultiThreadDownloader(
         cancelFlag: AtomicBoolean,
         pauseFlag: AtomicBoolean,
         useRange: Boolean,
-        validator: String? = null
+        validator: String? = null,
+        activeThreadsCount: AtomicInteger? = null,
+        dynamicEndSupplier: (() -> Long)? = null
     ) {
         val isYt = isYouTubeOrGoogleVideo(url)
         val userAgent = if (isYt) YOUTUBE_USER_AGENT else BROWSER_USER_AGENT
-        val expectedLength = if (chunkEnd > 0) (chunkEnd - chunkStart + 1) else -1L
 
         val callList = activeCalls.computeIfAbsent(downloadId) {
             java.util.Collections.synchronizedList(mutableListOf())
@@ -847,10 +977,19 @@ class MultiThreadDownloader(
         val maxAttempts = 6
         var lastDownloadedBytes = -1L
         while (attempts < maxAttempts && !cancelFlag.get() && !pauseFlag.get()) {
+            val currentDynamicEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
+            val expectedLength = if (currentDynamicEnd > 0) (currentDynamicEnd - chunkStart + 1) else -1L
+
             val existingBytes = if (useRange && partFile.exists()) partFile.length() else 0L
             partProgressBytes.set(existingBytes)
 
             if (useRange && expectedLength > 0 && existingBytes >= expectedLength) {
+                if (existingBytes > expectedLength) {
+                    try {
+                        java.io.RandomAccessFile(partFile, "rw").use { it.setLength(expectedLength) }
+                    } catch (_: Exception) {}
+                    partProgressBytes.set(expectedLength)
+                }
                 return
             }
 
@@ -874,7 +1013,8 @@ class MultiThreadDownloader(
             }
 
             if (useRange && chunkStart >= 0) {
-                val rangeHeader = if (chunkEnd > 0) "bytes=$requestStart-$chunkEnd" else "bytes=$requestStart-"
+                val targetEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
+                val rangeHeader = if (targetEnd > 0) "bytes=$requestStart-$targetEnd" else "bytes=$requestStart-"
                 requestBuilder.header("Range", rangeHeader)
                 val safeValidator = if (!validator.isNullOrBlank() && !validator.trim().startsWith("W/", ignoreCase = true)) {
                     validator.trim()
@@ -925,9 +1065,10 @@ class MultiThreadDownloader(
 
                 if (code == 206) {
                     val contentRange = response.header("Content-Range")
-                    if (!isValidContentRange(contentRange, requestStart, chunkEnd)) {
+                    val targetEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
+                    if (!isValidContentRange(contentRange, requestStart, targetEnd)) {
                         response.close()
-                        throw IOException("HTTP 206 Content-Range mismatch: '$contentRange', expected start $requestStart, end $chunkEnd")
+                        throw IOException("HTTP 206 Content-Range mismatch: '$contentRange', expected start $requestStart, end $targetEnd")
                     }
                 }
 
@@ -945,8 +1086,10 @@ class MultiThreadDownloader(
                         var intervalBytesRead = 0L
 
                         while (!cancelFlag.get() && !pauseFlag.get()) {
+                            val curEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
+                            val curExpectedLen = if (curEnd > 0) (curEnd - chunkStart + 1) else expectedLength
                             val currentPartLen = partProgressBytes.get() + uncommittedBytes
-                            val remainingExpected = if (expectedLength > 0) (expectedLength - currentPartLen) else Long.MAX_VALUE
+                            val remainingExpected = if (curExpectedLen > 0) (curExpectedLen - currentPartLen) else Long.MAX_VALUE
                             if (remainingExpected <= 0) break
 
                             val read = stream.read(buffer)
@@ -959,15 +1102,16 @@ class MultiThreadDownloader(
                             if (maxToWrite > 0) {
                                 fileOut.write(buffer, 0, maxToWrite)
                                 uncommittedBytes += maxToWrite
-                                if (uncommittedBytes >= 65536L || (expectedLength > 0 && currentPartLen + maxToWrite >= expectedLength)) {
+                                if (uncommittedBytes >= 65536L || (curExpectedLen > 0 && currentPartLen + maxToWrite >= curExpectedLen)) {
                                     partProgressBytes.addAndGet(uncommittedBytes)
                                     totalDownloaded.addAndGet(uncommittedBytes)
                                     uncommittedBytes = 0L
                                 }
                             }
 
-                            if (read > maxToWrite) {
-                                throw IOException("Part oversized: received $read bytes exceeding remaining expected range $remainingExpected")
+                            // If this part has received all its expected bytes, finish reading this stream cleanly!
+                            if (curExpectedLen > 0 && (currentPartLen + maxToWrite >= curExpectedLen)) {
+                                break
                             }
 
                             if (speedLimitKbps > 0) {
@@ -978,15 +1122,24 @@ class MultiThreadDownloader(
                                 }
                             }
 
-                            // Dynamic connection stall / throttle auto-refresh:
-                            // If a thread's connection gets throttled (< 10 KB/s) for 6+ seconds while large data remains,
-                            // refresh the connection so the server grants the initial high-speed burst rate again.
-                            if (useRange && threadCount > 1 && remainingExpected > 500 * 1024L) {
+                            // Dynamic connection stall auto-refresh & Endgame burst accelerator:
+                            // In endgame (few active threads remaining), detect stalls within 3s and require >= 150 KB/s
+                            if (useRange && threadCount > 1 && remainingExpected > 32 * 1024L) {
+                                val remainingActive = activeThreadsCount?.get() ?: threadCount
+                                val isEndgame = remainingActive <= maxOf(3, threadCount / 10)
+                                val checkIntervalMs = if (isEndgame) 3000L else 8000L
                                 val intervalElapsed = now - intervalStartTime
-                                if (intervalElapsed >= 6000L) {
+
+                                if (intervalElapsed >= checkIntervalMs) {
                                     val intervalSpeedBps = (intervalBytesRead * 1000L) / intervalElapsed
-                                    if (intervalSpeedBps < 10 * 1024L) {
-                                        Log.w(TAG, "Part $chunkStart throttled by server (${intervalSpeedBps / 1024} KB/s), auto-refreshing connection...")
+                                    val stallThresholdBps = if (isEndgame) {
+                                        150 * 1024L // Fast burst threshold in endgame
+                                    } else {
+                                        (10 * 1024L) / maxOf(1, threadCount / 8)
+                                    }
+
+                                    if (intervalSpeedBps < stallThresholdBps) {
+                                        Log.w(TAG, "Part $chunkStart stalled/throttled (${intervalSpeedBps / 1024} KB/s < ${stallThresholdBps / 1024} KB/s, endgame=$isEndgame), auto-refreshing connection...")
                                         throw SocketTimeoutException("Connection throttled by server, auto-accelerating...")
                                     }
                                     intervalStartTime = now
@@ -1005,23 +1158,28 @@ class MultiThreadDownloader(
                 response.close()
 
                 val finalPartLen = partFile.length()
-                if (expectedLength > 0) {
-                    if (finalPartLen > expectedLength) {
-                        partFile.delete()
-                        throw IOException("Part oversized: $finalPartLen exceeds expected $expectedLength")
+                val curTargetEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
+                val curExpectedLen = if (curTargetEnd > 0) (curTargetEnd - chunkStart + 1) else expectedLength
+                if (curExpectedLen > 0) {
+                    if (finalPartLen > curExpectedLen) {
+                        try {
+                            java.io.RandomAccessFile(partFile, "rw").use { it.setLength(curExpectedLen) }
+                        } catch (_: Exception) {}
+                        partProgressBytes.set(curExpectedLen)
+                        return
                     }
-                    if (finalPartLen < expectedLength) {
+                    if (finalPartLen < curExpectedLen) {
                         if (!useRange) {
                             totalDownloaded.addAndGet(-finalPartLen)
                             partProgressBytes.set(0L)
                         }
                         if (attempts >= maxAttempts) {
                             if (!cancelFlag.get() && !pauseFlag.get()) {
-                                throw IOException("Short part received: $finalPartLen of expected $expectedLength bytes after $maxAttempts attempts")
+                                throw IOException("Short part received: $finalPartLen of expected $curExpectedLen bytes after $maxAttempts attempts")
                             }
                             return
                         }
-                        Log.w(TAG, "Short part received: $finalPartLen < $expectedLength. Retrying from offset...")
+                        Log.w(TAG, "Short part received: $finalPartLen < $curExpectedLen. Retrying from offset...")
                         continue
                     }
                 }
@@ -1056,8 +1214,12 @@ class MultiThreadDownloader(
                 callList.remove(call)
             }
         }
-        if (!cancelFlag.get() && !pauseFlag.get() && expectedLength > 0 && partFile.length() < expectedLength) {
-            throw IOException("Part incomplete: ${partFile.length()} of expected $expectedLength bytes after $attempts attempts")
+        val finalExpectedLen = run {
+            val curEnd = dynamicEndSupplier?.invoke() ?: chunkEnd
+            if (curEnd > 0) (curEnd - chunkStart + 1) else -1L
+        }
+        if (!cancelFlag.get() && !pauseFlag.get() && finalExpectedLen > 0 && partFile.length() < finalExpectedLen) {
+            throw IOException("Part incomplete: ${partFile.length()} of expected $finalExpectedLen bytes after $attempts attempts")
         }
     }
 

@@ -66,11 +66,11 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun addDownload(url: String, fileName: String, threads: Int, audioUrl: String? = null, originalUrl: String? = null) {
-        viewModelScope.launch { repo.addDownload(url = url, fileName = fileName, threads = threads, audioUrl = audioUrl, originalUrl = originalUrl) }
+        repo.addDownloadAsync(url = url, fileName = fileName, threads = threads, audioUrl = audioUrl, originalUrl = originalUrl)
     }
 
     fun addBatchDownloads(urls: List<String>, threads: Int) {
-        viewModelScope.launch { repo.addBatchDownloads(urls, threads) }
+        repo.addBatchDownloadsAsync(urls, threads)
     }
 
     suspend fun calculateChecksums(filePath: String): Pair<String, String> {
