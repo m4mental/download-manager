@@ -718,14 +718,15 @@ fun DownloadManagerScreen(viewModel: DownloadViewModel) {
             confirmButton = {
                 Button(
                     onClick = {
-                        selectedIds.forEach { id ->
+                        val idsToDelete = selectedIds
+                        selectedIds = emptySet()
+                        showBatchDeleteDialog = false
+                        idsToDelete.forEach { id ->
                             val itm = downloads.find { it.id == id }
                             if (itm != null) {
                                 viewModel.delete(itm, deleteFromDisk)
                             }
                         }
-                        selectedIds = emptySet()
-                        showBatchDeleteDialog = false
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Red)
                 ) {

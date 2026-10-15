@@ -28,9 +28,7 @@ object GeckoEngine {
             val isDebuggable = (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
             val browserSettings = runCatching {
-                kotlinx.coroutines.runBlocking {
-                    com.example.speeddown.data.BrowserSettingsStore.getInstance(context).getSnapshot()
-                }
+                com.example.speeddown.data.BrowserSettingsStore.getInstance(context).getSnapshot()
             }.getOrNull()
 
             val cookieBehavior = if (browserSettings?.acceptThirdPartyCookies == false) {

@@ -2,9 +2,15 @@ package com.example.speeddown.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -78,7 +84,9 @@ class BrowserSettingsStore private constructor(private val context: Context) {
     private val BLOCK_POPUPS_KEY = booleanPreferencesKey("browser_block_popups")
     private val SHORTCUTS_KEY = stringPreferencesKey("browser_shortcuts_json")
 
-    val settings: Flow<BrowserSettings> = context.dataStore.data.map { prefs ->
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    val settings: StateFlow<BrowserSettings> = context.dataStore.data.map { prefs ->
         BrowserSettings(
             searchEngine = prefs[SEARCH_ENGINE_KEY] ?: "Google",
             dnsProvider = prefs[DNS_PROVIDER_KEY] ?: "Cloudflare",
@@ -93,7 +101,7 @@ class BrowserSettingsStore private constructor(private val context: Context) {
             javaScriptEnabled = prefs[JAVASCRIPT_KEY] ?: true,
             blockPopups = prefs[BLOCK_POPUPS_KEY] ?: true
         )
-    }
+    }.stateIn(scope, SharingStarted.Eagerly, BrowserSettings())
 
     val shortcuts: Flow<List<BrowserShortcut>> = context.dataStore.data.map { prefs ->
         val raw = prefs[SHORTCUTS_KEY]
@@ -116,23 +124,7 @@ class BrowserSettingsStore private constructor(private val context: Context) {
         }
     }
 
-    suspend fun getSnapshot(): BrowserSettings {
-        val prefs = context.dataStore.data.first()
-        return BrowserSettings(
-            searchEngine = prefs[SEARCH_ENGINE_KEY] ?: "Google",
-            dnsProvider = prefs[DNS_PROVIDER_KEY] ?: "Cloudflare",
-            customDnsHost = prefs[CUSTOM_DNS_HOST_KEY] ?: "",
-            customDnsIp = prefs[CUSTOM_DNS_IP_KEY] ?: "",
-            httpsOnly = prefs[HTTPS_ONLY_KEY] ?: true,
-            doNotTrack = prefs[DO_NOT_TRACK_KEY] ?: true,
-            acceptThirdPartyCookies = prefs[THIRD_PARTY_COOKIES_KEY] ?: true,
-            forceDarkMode = prefs[FORCE_DARK_KEY] ?: false,
-            defaultDesktopMode = prefs[DEFAULT_DESKTOP_KEY] ?: false,
-            textZoom = prefs[TEXT_ZOOM_KEY] ?: 100,
-            javaScriptEnabled = prefs[JAVASCRIPT_KEY] ?: true,
-            blockPopups = prefs[BLOCK_POPUPS_KEY] ?: true
-        )
-    }
+    fun getSnapshot(): BrowserSettings = settings.value
 
     suspend fun updateSettings(newSettings: BrowserSettings) {
         context.dataStore.edit { prefs ->

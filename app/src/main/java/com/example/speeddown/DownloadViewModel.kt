@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.speeddown.data.DownloadItem
 import com.example.speeddown.data.DownloadSettings
 import com.example.speeddown.data.DownloadStatus
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
@@ -78,16 +79,16 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun pause(item: DownloadItem) {
-        viewModelScope.launch { repo.pauseDownload(item) }
+        viewModelScope.launch(Dispatchers.IO) { repo.pauseDownload(item) }
     }
 
     fun resume(item: DownloadItem) {
-        viewModelScope.launch { repo.resumeDownload(item) }
+        viewModelScope.launch(Dispatchers.IO) { repo.resumeDownload(item) }
     }
 
     /** Fixed: passes full item so QUEUED items can be cancelled directly */
     fun cancel(item: DownloadItem) {
-        viewModelScope.launch { repo.cancelDownload(item) }
+        viewModelScope.launch(Dispatchers.IO) { repo.cancelDownload(item) }
     }
 
     fun open(item: DownloadItem) = repo.openFile(item)
@@ -96,31 +97,37 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun openInNothingPlayer(item: DownloadItem): Boolean = repo.openInNothingPlayer(item)
 
-    fun streamInNothingPlayer(item: DownloadItem): Boolean = kotlinx.coroutines.runBlocking { repo.streamInNothingPlayer(item) }
+    fun streamInNothingPlayer(item: DownloadItem) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repo.streamInNothingPlayer(item)
+        }
+    }
 
     fun launchNothingPlayer(): Boolean = repo.launchNothingPlayerApp()
 
     fun checkDuplicate(fileName: String): java.io.File? = repo.checkDuplicateFile(fileName)
 
     fun refreshUrl(downloadId: Long, newUrl: String) {
-        viewModelScope.launch { repo.refreshDownloadUrl(downloadId, newUrl) }
+        viewModelScope.launch(Dispatchers.IO) { repo.refreshDownloadUrl(downloadId, newUrl) }
     }
 
     suspend fun getStorageBreakdown(): DownloadRepository.StorageBreakdown = repo.calculateStorageBreakdown()
 
     fun cleanupOrphanedParts(onComplete: (Int) -> Unit) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val count = repo.cleanupOrphanedParts()
-            onComplete(count)
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                onComplete(count)
+            }
         }
     }
 
     fun delete(item: DownloadItem, deleteFile: Boolean = true) {
-        viewModelScope.launch { repo.deleteDownload(item, deleteFile) }
+        viewModelScope.launch(Dispatchers.IO) { repo.deleteDownload(item, deleteFile) }
     }
 
     fun clearCompleted() {
-        viewModelScope.launch { repo.clearCompleted() }
+        viewModelScope.launch(Dispatchers.IO) { repo.clearCompleted() }
     }
 }
 

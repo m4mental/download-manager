@@ -114,7 +114,7 @@ class DownloadRepository(private val context: Context) {
         threads: Int = 4,
         audioUrl: String? = null,
         originalUrl: String? = null
-    ): Long = withContext(NonCancellable) {
+    ): Long = withContext(Dispatchers.IO + NonCancellable) {
         val cleanUrl = url.trim()
 
         // 1. Auto-revive / Restart check:
@@ -242,11 +242,11 @@ class DownloadRepository(private val context: Context) {
         startServiceAction(DownloadService.ACTION_RESUME, downloadId)
     }
 
-    suspend fun streamInNothingPlayer(item: DownloadItem): Boolean {
+    suspend fun streamInNothingPlayer(item: DownloadItem): Boolean = withContext(Dispatchers.IO) {
         val streamServer = com.example.speeddown.engine.LocalStreamServer.getInstance(store)
         val streamUrl = streamServer.getStreamUrl(item.id, item.fileName)
         val uri = Uri.parse(streamUrl)
-        return try {
+        try {
             val intent = Intent().apply {
                 setClassName("com.nothing.player", "com.nothing.player.ExoVideoPlayerActivity")
                 putExtra("title", item.fileName)
@@ -338,7 +338,7 @@ class DownloadRepository(private val context: Context) {
         deletedCount
     }
 
-    suspend fun addBatchDownloads(urls: List<String>, threads: Int = 16): Int = withContext(NonCancellable) {
+    suspend fun addBatchDownloads(urls: List<String>, threads: Int = 16): Int = withContext(Dispatchers.IO + NonCancellable) {
         var count = 0
         for (u in urls) {
             val clean = u.trim()
@@ -374,12 +374,12 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
-    suspend fun pauseDownload(item: DownloadItem) = withContext(NonCancellable) {
+    suspend fun pauseDownload(item: DownloadItem) = withContext(Dispatchers.IO + NonCancellable) {
         store.updateStatus(item.id, DownloadStatus.PAUSED)
         startServiceAction(DownloadService.ACTION_PAUSE, item.id)
     }
 
-    suspend fun resumeDownload(item: DownloadItem) = withContext(NonCancellable) {
+    suspend fun resumeDownload(item: DownloadItem) = withContext(Dispatchers.IO + NonCancellable) {
         val file = File(item.filePath)
         val parent = file.parentFile
         val correctedItem = if (parent == null || !parent.canWrite()) {
@@ -475,24 +475,22 @@ class DownloadRepository(private val context: Context) {
         startServiceAction(DownloadService.ACTION_RESUME, correctedItem.id)
     }
 
-    suspend fun cancelDownload(item: DownloadItem) = withContext(NonCancellable) {
+    suspend fun cancelDownload(item: DownloadItem) = withContext(Dispatchers.IO + NonCancellable) {
         store.updateStatus(item.id, DownloadStatus.CANCELLED)
         startServiceAction(DownloadService.ACTION_CANCEL, item.id)
     }
 
-    suspend fun deleteDownload(item: DownloadItem, deleteFile: Boolean = true) = withContext(NonCancellable) {
-        // 1. Mark cancelled first so UI immediately updates
+    suspend fun deleteDownload(item: DownloadItem, deleteFile: Boolean = true) = withContext(Dispatchers.IO + NonCancellable) {
+        // 1. Mark cancelled and remove from store immediately so UI updates with zero delay
         store.updateStatus(item.id, DownloadStatus.CANCELLED)
+        store.remove(item.id)
 
-        // 2. Use cancel-and-join instead of arbitrary delay
+        // 2. Stop running engines and notify service
         com.example.speeddown.engine.MultiThreadDownloader.cancelAndJoin(item.id)
         com.example.speeddown.engine.HlsDownloader.cancelAndJoin(item.id)
         startServiceAction(DownloadService.ACTION_CANCEL, item.id)
 
-        // 3. Remove from store
-        store.remove(item.id)
-
-        // 4. Delete target, HTTP parts, HLS _parts, .video.tmp, .audio.tmp, and .torrent sidecar
+        // 3. Delete target, HTTP parts, HLS _parts, .video.tmp, .audio.tmp, and .torrent sidecar on IO thread pool
         if (deleteFile) {
             try {
                 val file = File(item.filePath)
@@ -501,10 +499,10 @@ class DownloadRepository(private val context: Context) {
                 val singlePart = File("${item.filePath}.part")
                 if (singlePart.exists()) singlePart.delete()
 
-                file.parentFile?.listFiles()?.forEach { f ->
-                    if (f.name.startsWith(file.name + ".part")) {
-                        f.delete()
-                    }
+                file.parentFile?.listFiles { f ->
+                    f.name.startsWith(file.name + ".part")
+                }?.forEach { f ->
+                    try { f.delete() } catch (_: Exception) {}
                 }
 
                 val hlsDir = File("${item.filePath}_parts")
@@ -522,9 +520,9 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
-    suspend fun clearCompleted() = store.clearByStatus(DownloadStatus.COMPLETED)
+    suspend fun clearCompleted() = withContext(Dispatchers.IO) { store.clearByStatus(DownloadStatus.COMPLETED) }
 
-    suspend fun clearAll() {
+    suspend fun clearAll() = withContext(Dispatchers.IO) {
         store.clearByStatus(DownloadStatus.COMPLETED)
         store.clearByStatus(DownloadStatus.FAILED)
         store.clearByStatus(DownloadStatus.CANCELLED)
@@ -621,9 +619,7 @@ class DownloadRepository(private val context: Context) {
         }
 
         // Smart route to Nothing Player if preferred and media type
-        val snapshot = kotlinx.coroutines.runBlocking {
-            try { store.getSettingsSnapshot() } catch (_: Exception) { DownloadSettings() }
-        }
+        val snapshot = try { store.getSettingsSnapshot() } catch (_: Exception) { DownloadSettings() }
         if (snapshot.preferNothingPlayer && (item.category == "Videos" || item.category == "Music") && isNothingPlayerInstalled()) {
             if (openInNothingPlayer(item)) return
         }

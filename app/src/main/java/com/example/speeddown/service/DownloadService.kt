@@ -489,8 +489,10 @@ class DownloadService : Service() {
 
     private fun showDownloadCompleteNotification(fileName: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val settings = kotlinx.coroutines.runBlocking {
-            try { store.getSettingsSnapshot() } catch (_: Exception) { com.example.speeddown.data.DownloadSettings() }
+        val settings = try {
+            store.getSettingsSnapshot()
+        } catch (_: Exception) {
+            com.example.speeddown.data.DownloadSettings()
         }
 
         // Haptic feedback if enabled

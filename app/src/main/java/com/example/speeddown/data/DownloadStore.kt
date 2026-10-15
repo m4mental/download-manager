@@ -8,9 +8,12 @@ import com.example.speeddown.data.db.DownloadDatabaseHelper
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -55,7 +58,11 @@ class DownloadStore private constructor(private val context: Context) {
     private val SOUND_ON_COMPLETE_KEY = booleanPreferencesKey("settings_sound_on_complete")
     private val DEFAULT_THREADS_KEY = intPreferencesKey("settings_default_threads")
 
-    val settings: Flow<DownloadSettings> = context.dataStore.data.map { prefs ->
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val dbDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private val isLoaded = CompletableDeferred<Unit>()
+
+    val settings: StateFlow<DownloadSettings> = context.dataStore.data.map { prefs ->
         DownloadSettings(
             maxConcurrent = prefs[MAX_CONCURRENT_KEY] ?: 2,
             wifiOnly = prefs[WIFI_ONLY_KEY] ?: false,
@@ -66,21 +73,9 @@ class DownloadStore private constructor(private val context: Context) {
             soundOnComplete = prefs[SOUND_ON_COMPLETE_KEY] ?: true,
             defaultThreads = prefs[DEFAULT_THREADS_KEY] ?: 8
         )
-    }
+    }.stateIn(scope, SharingStarted.Eagerly, DownloadSettings())
 
-    suspend fun getSettingsSnapshot(): DownloadSettings {
-        val prefs = context.dataStore.data.first()
-        return DownloadSettings(
-            maxConcurrent = prefs[MAX_CONCURRENT_KEY] ?: 2,
-            wifiOnly = prefs[WIFI_ONLY_KEY] ?: false,
-            autoCategorize = prefs[AUTO_CATEGORIZE_KEY] ?: true,
-            speedLimitKbps = prefs[SPEED_LIMIT_KEY] ?: 0L,
-            preferNothingPlayer = prefs[PREFER_NOTHING_PLAYER_KEY] ?: true,
-            vibrateOnComplete = prefs[VIBRATE_ON_COMPLETE_KEY] ?: true,
-            soundOnComplete = prefs[SOUND_ON_COMPLETE_KEY] ?: true,
-            defaultThreads = prefs[DEFAULT_THREADS_KEY] ?: 8
-        )
-    }
+    fun getSettingsSnapshot(): DownloadSettings = settings.value
 
     suspend fun updateSettings(newSettings: DownloadSettings) {
         context.dataStore.edit { prefs ->
@@ -94,10 +89,6 @@ class DownloadStore private constructor(private val context: Context) {
             prefs[DEFAULT_THREADS_KEY] = newSettings.defaultThreads
         }
     }
-
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val dbDispatcher = java.util.concurrent.Executors.newSingleThreadExecutor().asCoroutineDispatcher()
-    private val isLoaded = CompletableDeferred<Unit>()
 
     private val _downloadsState = MutableStateFlow<List<DownloadItem>>(emptyList())
     val allDownloads: Flow<List<DownloadItem>> = _downloadsState.asStateFlow()
